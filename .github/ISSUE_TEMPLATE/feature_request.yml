@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest something this tool should do.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project deliberately stays small: pick an account, switch an
+        account, add an account. Requests that keep the everyday `claude` path
+        fast and quiet have the best chance.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the situation, not the solution. What did you want and what got in the way?
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to happen?
+      description: If you have a command or flag in mind, write out what you would type.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Does it fit the constraints?
+      options:
+        - label: It does not require a runtime dependency
+        - label: It does not require writing to the user's real Claude Code files
+        - label: It does not slow down or add output to a bare `claude`

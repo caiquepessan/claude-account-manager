@@ -1,0 +1,53 @@
+name: Bug report
+description: Something behaves differently from what the README says it does.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please paste the output of `cam doctor` below — it answers about
+        two-thirds of the questions a maintainer would otherwise have to ask.
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `cam doctor`
+      description: >
+        This reports your platform, Node and Claude Code versions, which
+        credential backend you are on, terminal capabilities, and per-account
+        health. It contains account emails — redact them if you would rather not
+        share them. It never contains tokens.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got instead.
+      placeholder: |
+        I ran: claude
+        I expected: the account picker
+        I got: it launched "work" straight away with no menu
+    validations:
+      required: true
+
+  - type: input
+    id: shell
+    attributes:
+      label: Shell and terminal
+      placeholder: PowerShell 7 in Windows Terminal / zsh in iTerm2 / bash in mintty
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hook
+    attributes:
+      label: Is the `claude` shell hook installed?
+      options:
+        - 'Yes (cam shell install)'
+        - 'No — I run `cam` directly'
+        - "Not sure — `cam shell status` will say"
+    validations:
+      required: true

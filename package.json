@@ -1,0 +1,46 @@
+{
+  "name": "@caiquepessan/claude-account-manager",
+  "version": "0.1.0",
+  "description": "Pick which Claude account `claude` starts with. One environment variable on one spawned process, zero dependencies. Not affiliated with, endorsed by, or sponsored by Anthropic.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "account",
+    "profile",
+    "switcher",
+    "cli",
+    "zero-dependencies"
+  ],
+  "homepage": "https://github.com/caiquepessan/claude-account-manager#readme",
+  "bugs": {
+    "url": "https://github.com/caiquepessan/claude-account-manager/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/caiquepessan/claude-account-manager.git"
+  },
+  "license": "MIT",
+  "author": "Caique Pessan",
+  "type": "module",
+  "bin": {
+    "cam": "bin/cam.js",
+    "claude-account-manager": "bin/cam.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.pt-BR.md",
+    "SECURITY.md"
+  ],
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --test test/pure.test.js",
+    "check": "npm run lint && npm test && npm pack --dry-run"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test · node ${{ matrix.node }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['18.17', '20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No dependencies to install — this package has none, by design.
+      - name: Run tests
+        run: node --test
+
+  lint:
+    name: lint · syntax + conventions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # `node --check` parses .js as CommonJS on Node 18, which reports false
+      # ESM syntax errors, so the syntax gate runs on one modern Node only.
+      - name: Syntax check every source file
+        run: |
+          set -e
+          for f in $(git ls-files '*.js' '*.mjs'); do
+            node --check "$f"
+          done
+      - name: No CRLF in tracked text files
+        run: |
+          if git ls-files --eol | grep -E 'w/crlf|w/mixed' | grep -v '\.ps1$'; then
+            echo "::error::CRLF found in a tracked file (only .ps1 may use CRLF)"
+            exit 1
+          fi
+      - name: Manifest has no dependencies
+        run: |
+          node -e "
+            const p = require('./package.json');
+            const bad = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
+              .filter(k => p[k] && Object.keys(p[k]).length);
+            if (bad.length) { console.error('This package must stay dependency-free, found:', bad.join(', ')); process.exit(1); }
+          "
+
+  smoke:
+    name: smoke · pack + global install · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # This job is what catches a missing shebang, a CRLF shebang, a wrong bin
+      # path, or a file left out of the package.json "files" allowlist — none of
+      # which the unit tests can see.
+      - name: Pack and install globally
+        shell: bash
+        run: |
+          set -e
+          npm pack
+          npm i -g ./*.tgz
+      - name: Both bins run
+        shell: bash
+        run: |
+          set -e
+          cam --version
+          claude-account-manager --version
+          cam help
+      - name: Help works with no config, no store and no claude binary
+        shell: bash
+        env:
+          CAM_HOME: ${{ runner.temp }}/empty-cam-home
+          CAM_NO_PROMPT: '1'
+        run: cam help --all

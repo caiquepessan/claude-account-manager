@@ -1,0 +1,50 @@
+name: Publish to npm
+
+# Publishes on a pushed tag like v0.1.0. The tag must match the version in
+# package.json or the job fails before anything is published.
+#
+# Authentication is npm Trusted Publishing (OIDC) — npm classic automation
+# tokens were permanently revoked in late 2025, so there is no NPM_TOKEN here.
+# Provenance is generated automatically for a trusted publish: passing
+# --provenance would be redundant and can fail the run.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for Trusted Publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing needs a recent npm; the one bundled with Node 22 is
+      # older than the OIDC support.
+      - name: Use an npm that can publish with OIDC
+        run: npm install -g npm@latest
+
+      - name: Tag must match package.json version
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+
+      - name: Test before publishing
+        run: node --test
+
+      - name: Publish
+        run: npm publish
