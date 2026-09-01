@@ -1,9 +1,9 @@
 # Claude Account Manager (`cam`)
 
-[![versão no npm](https://img.shields.io/npm/v/%40caiquepessan%2Fclaude-account-manager)](https://www.npmjs.com/package/@caiquepessan/claude-account-manager)
 [![CI](https://github.com/caiquepessan/claude-account-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/caiquepessan/claude-account-manager/actions/workflows/ci.yml)
-[![licença](https://img.shields.io/npm/l/%40caiquepessan%2Fclaude-account-manager)](LICENSE)
-[![node](https://img.shields.io/node/v/%40caiquepessan%2Fclaude-account-manager)](https://nodejs.org)
+[![licença](https://img.shields.io/github/license/caiquepessan/claude-account-manager)](LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A518.17-brightgreen)](https://nodejs.org)
+[![dependências](https://img.shields.io/badge/dependencies-zero-brightgreen)](package.json)
 
 Escolha com qual conta Claude o `claude` inicia.
 
