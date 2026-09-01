@@ -389,6 +389,18 @@ ou seja, o isolamento não vale. A causa comum é a variável
 7-bit para todo símbolo, separador e reticência; `NO_COLOR=1` (ou `--no-color`)
 tira a cor. O layout é idêntico dos dois jeitos.
 
+**Um `%VARIÁVEL%` no prompt chega expandido — só no Windows.** Se o seu Claude
+Code foi instalado com `npm i -g`, o ponto de entrada é um `claude.cmd`, e um
+`.cmd` só pode ser iniciado através do `cmd.exe`. O `cmd.exe` substitui `%NOME%`
+por qualquer variável de ambiente que exista *antes* de o programa começar,
+então `claude "estamos com 100%CPU% de carga"` chega com `%CPU%` já trocado.
+Isso é comportamento documentado do `cmd.exe` e não tem escape na linha de
+comando — `%%` só funciona dentro de um arquivo .bat —, então nenhuma
+ferramenta consegue evitar por completo. Duas saídas: usar o instalador nativo,
+cujo `claude.exe` é executado direto e nunca passa por shell, ou mandar o texto
+pela entrada padrão (`… | claude -p -`) em vez de como argumento. Nomes que não
+existem como variável passam intactos.
+
 **Outra coisa.** O `cam which -v` mostra exatamente qual conta seria usada, por
 quê, qual binário rodaria e a linha de comando completa — normalmente mais rápido
 que adivinhar.

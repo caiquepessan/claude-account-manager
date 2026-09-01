@@ -383,6 +383,17 @@ and run `cam doctor`.
 7-bit output for every glyph, separator and ellipsis; `NO_COLOR=1` (or
 `--no-color`) drops colour. The layout is identical either way.
 
+**A `%VARIABLE%` in a prompt comes out expanded, on Windows only.** If your
+Claude Code was installed with `npm i -g`, the entry point is `claude.cmd`, and
+a `.cmd` file can only be started through `cmd.exe`. `cmd.exe` substitutes
+`%NAME%` for any environment variable that exists *before* the program is
+started, so `claude "we are at 100%CPU% load"` arrives with `%CPU%` replaced.
+This is a documented `cmd.exe` behaviour with no escape at the command line —
+`%%` only works inside a batch file — so no tool can fully avoid it. Two ways
+around it: use the native installer, whose `claude.exe` is spawned directly and
+never sees a shell, or pass the text on stdin (`… | claude -p -`) rather than as
+an argument. Names that do not exist as variables are passed through untouched.
+
 **Something else.** `cam which -v` shows exactly which account would be used,
 why, which binary would run, and the full command line — usually faster than
 guessing.
