@@ -1601,9 +1601,28 @@ describe('18 — launch end-to-end', () => {
     assert.equal(meta.launchCount, 1, 'refreshMeta did not run after the child exited');
     assert.equal(meta.lastUsedAt, sb.at());
     assert.equal(meta.checkedAt, sb.at());
-    // The fingerprint is re-derived from the live credentials file, never copied.
-    assert.match(meta.tokenFingerprint, /^[0-9a-f]{12}$/);
-    assert.notEqual(meta.tokenFingerprint, 'abc123abc123', 'the stale fingerprint was not refreshed');
+
+    // What refreshMeta may derive is a PROPERTY OF THE CREDENTIAL BACKEND, and
+    // the backend differs by platform — so assert the platform's own contract
+    // rather than the one this machine happens to have.
+    if (process.platform === 'darwin') {
+      // macOS is Keychain-backed, and credstore.summary deliberately reads
+      // NOTHING there: opening the store would raise a Keychain prompt, and a
+      // prompt must never be a side effect of drawing a menu. The cached values
+      // are therefore carried forward untouched. This is the behaviour
+      // SECURITY.md promises, so the test holds it to exactly that.
+      assert.equal(
+        meta.tokenFingerprint,
+        'abc123abc123',
+        'macOS must not open the credential store to refresh a fingerprint',
+      );
+      assert.equal(meta.backend, 'keychain');
+    } else {
+      // Linux and Windows are file-backed: the fingerprint is re-derived from
+      // the live credentials file on every session, never copied forward.
+      assert.match(meta.tokenFingerprint, /^[0-9a-f]{12}$/);
+      assert.notEqual(meta.tokenFingerprint, 'abc123abc123', 'the stale fingerprint was not refreshed');
+    }
   });
 
   it('the active account is remembered before the spawn, not after', async () => {

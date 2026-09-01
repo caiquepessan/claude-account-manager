@@ -5,7 +5,7 @@
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 
-import { readJsonSafe, rmrf, sha256Hex } from './fsx.js';
+import { canonical, readJsonSafe, rmrf, sha256Hex } from './fsx.js';
 import { runCapture } from './claude.js';
 import { fail } from './ctx.js';
 
@@ -133,7 +133,21 @@ function samePath(ctx, a, b) {
     const s = normDir(p).split('\\').join('/');
     return ctx.platform === 'win32' ? s.toLowerCase() : s;
   };
-  return loose(a) === loose(b);
+  if (loose(a) === loose(b)) return true;
+
+  // Two spellings the OS considers one file: an 8.3 alias on Windows
+  // (`C:\Users\RUNNER~1\…`), a symlinked home, or macOS's `/var` → `/private/var`.
+  // A purely textual comparison misses all three, and MISSING here means the
+  // guard fails OPEN — it is what decides whether a directory is the user's real
+  // ~/.claude, so a miss would let `cam rm --purge` reach the login itself.
+  // Matching by either route is the safe direction for a guard that refuses.
+  try {
+    const ca = canonical(a);
+    const cb = canonical(b);
+    return ctx.platform === 'win32' ? ca.toLowerCase() === cb.toLowerCase() : ca === cb;
+  } catch {
+    return false;
+  }
 }
 
 /**

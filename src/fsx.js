@@ -3,7 +3,7 @@
 // must guess about: atomic writes, one-time backups, link-safe deletion.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { constants as FS, promises as fsp } from 'node:fs';
+import { constants as FS, promises as fsp, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -109,6 +109,19 @@ function storeRoot(ctx) {
  * @returns {boolean} Whether child is contained by parent.
  */
 function isInside(parent, child) {
+  // DELIBERATELY LEXICAL — do not "improve" this with realpath.
+  //
+  // Guards come in two directions and want opposite treatment. A guard that
+  // REFUSES (assertNotClaudeOwned) is safest when it matches MORE, so it
+  // canonicalises: two spellings of ~/.claude must both be caught. This guard
+  // ALLOWS a recursive delete, so it is safest when it matches LESS. Resolving
+  // links here would mean a link pointing into the store becomes an accepted
+  // delete target, which is precisely what "refused by path, not by inode"
+  // exists to prevent.
+  //
+  // The spelling mismatch that motivated canonicalising the other guard cannot
+  // arise here: both sides descend from the same storeRoot(ctx), so they are
+  // always written the same way.
   const a = path.resolve(parent);
   const b = path.resolve(child);
   if (a === b) return true;
@@ -148,6 +161,47 @@ function samePath(ctx, a, b) {
 }
 
 /**
+ * The one spelling of a path that the OS agrees with, so two names for the same
+ * file cannot slip past a guard by being spelled differently.
+ *
+ * `path.resolve` is not enough, and neither is `fs.realpath`. Measured on
+ * Windows: the same directory reachable as `…\shortname-Bol8yj\a-very-long-…`
+ * and as `…\SHORTN~1\A-VERY~1` gives two DIFFERENT answers from
+ * `fs.realpathSync`, because it does not expand 8.3 aliases — only
+ * `realpathSync.native` does, and it normalises case at the same time. GitHub's
+ * Windows runners hand out exactly that: `C:\Users\RUNNER~1\AppData\Local\Temp`.
+ * On macOS the same class appears as `/var/folders/…` versus
+ * `/private/var/folders/…`, which is where TMPDIR actually lives.
+ *
+ * Either way the consequence is the guard that keeps cam out of the user's real
+ * `~/.claude` comparing two spellings of one file and concluding they differ.
+ *
+ * The target may not exist yet — that is the normal case for a write — so this
+ * canonicalises the deepest ancestor that DOES exist and rejoins the rest.
+ * @param {string} p - Any path.
+ * @returns {string} The canonical spelling, or the resolved path if the OS cannot say.
+ */
+export function canonical(p) {
+  const abs = path.resolve(String(p));
+  const tail = [];
+  let head = abs;
+  // Bounded: every iteration drops one segment, and dirname() reaches a fixed
+  // point at the root, so this cannot spin on a malformed path.
+  for (let i = 0; i < 64; i += 1) {
+    try {
+      const real = realpathSync.native(head);
+      return tail.length ? path.join(real, ...tail.slice().reverse()) : real;
+    } catch {
+      const parent = path.dirname(head);
+      if (parent === head) return abs;
+      tail.push(path.basename(head));
+      head = parent;
+    }
+  }
+  return abs;
+}
+
+/**
  * The three files cam must never write, made unwritable structurally rather than
  * by convention: the user's real login is never touched by any code path.
  * @param {object} ctx - The cam context.
@@ -162,7 +216,18 @@ function assertNotClaudeOwned(ctx, file) {
     path.join(home, '.claude', '.claude.json'),
     path.join(home, '.claude', '.credentials.json')
   ];
-  if (!forbidden.some((f) => samePath(ctx, f, file))) return;
+  // This guard REFUSES, so it is safest when it matches MORE: a candidate counts
+  // as a hit if EITHER the canonical spellings agree (catching an 8.3 alias, a
+  // symlinked home, or /var vs /private/var) or the plain resolved paths do
+  // (catching the case where the file does not exist yet and the OS has no
+  // canonical answer to give). Missing here means writing the user's real login.
+  //
+  // The target is canonicalised ONCE rather than per candidate: this runs on
+  // every atomic write and each canonical() walk costs a realpath syscall.
+  const cased = isPosix(ctx) ? (s) => s : (s) => s.toLowerCase();
+  const hit = cased(canonical(file));
+  const matches = (f) => cased(canonical(f)) === hit || samePath(ctx, f, file);
+  if (!forbidden.some(matches)) return;
   failWith(
     'UNSAFE',
     tr(ctx, 'fsx.refuseClaudeOwned', { file: path.resolve(file) }),

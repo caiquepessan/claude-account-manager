@@ -481,3 +481,69 @@ describe('the generated runtimes keep to themselves', () => {
     assert.equal(r.stderr.trim(), '', `the hook wrote to stderr on its own: ${r.stderr.trim()}`);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Two spellings of one path must not be a way past the Claude-owned guard
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe('the Claude-owned guard compares files, not spellings', () => {
+  it('a home reached through a directory link still protects .credentials.json', async (t) => {
+    // REGRESSION, found by CI on Windows and not reproducible on a developer
+    // machine: the guard compared `path.resolve()` output, so the SAME file
+    // spelled two ways looked like two files and the write went through.
+    //   Windows: C:\Users\RUNNER~1\... vs C:\Users\runneradmin\...  (8.3 alias)
+    //   macOS:   /var/folders/...      vs /private/var/folders/...  (TMPDIR link)
+    // Only realpathSync.native collapses both, and it normalises case too.
+    const root = mkRoot('guard-spelling');
+    const realHome = path.join(root, 'real-home');
+    fs.mkdirSync(path.join(realHome, '.claude'), { recursive: true });
+    const creds = path.join(realHome, '.claude', '.credentials.json');
+    fs.writeFileSync(creds, '{"real":"token"}\n', 'utf8');
+
+    // A second spelling of the very same directory.
+    const linkedHome = path.join(root, 'linked-home');
+    let linked = false;
+    try {
+      fs.symlinkSync(realHome, linkedHome, WIN ? 'junction' : 'dir');
+      linked = fs.lstatSync(linkedHome).isSymbolicLink();
+    } catch {
+      linked = false;
+    }
+    if (!linked) {
+      t.skip('this machine refuses to create directory links');
+      return;
+    }
+
+    // ctx.home is the LINK; the write target is the REAL path. Two spellings,
+    // one file — exactly the shape that defeated the guard in CI.
+    const viaLink = makeCtx(linkedHome);
+    await assert.rejects(
+      () => fsx.writeFileAtomic(viaLink.ctx, creds, 'PWNED'),
+      (err) => err && err.name === 'CamError' && err.code === 'UNSAFE',
+      'the guard was defeated by spelling the home differently',
+    );
+
+    // And the mirror image: ctx.home real, target reached through the link.
+    const viaReal = makeCtx(realHome);
+    await assert.rejects(
+      () => fsx.writeFileAtomic(
+        viaReal.ctx,
+        path.join(linkedHome, '.claude', '.credentials.json'),
+        'PWNED',
+      ),
+      (err) => err && err.name === 'CamError' && err.code === 'UNSAFE',
+      'the guard was defeated by spelling the target differently',
+    );
+
+    assert.equal(fs.readFileSync(creds, 'utf8'), '{"real":"token"}\n', 'the real file was written');
+  });
+
+  it('still allows an ordinary write beside the protected files', async () => {
+    const root = mkRoot('guard-allows');
+    fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
+    const h = makeCtx(root);
+    const ok = path.join(root, '.claude', 'settings.json');
+    await fsx.writeFileAtomic(h.ctx, ok, '{"theme":"dark"}\n', { mode: 0o600 });
+    assert.equal(fs.readFileSync(ok, 'utf8'), '{"theme":"dark"}\n');
+  });
+});
