@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-09-01
 
+Published to npm as
+[`@caiquepessan/claude-account-manager`](https://www.npmjs.com/package/@caiquepessan/claude-account-manager).
+
 ### Added
 
 - Interactive account picker shown when you type a bare `claude`, with arrow-key
