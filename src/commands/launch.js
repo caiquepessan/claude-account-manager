@@ -695,7 +695,21 @@ export async function run(ctx, args) {
 
   // 8 — hand the terminal back before anything else can touch it.
   screen.restoreCursorSync();
-  note(ctx, ui.banner(profile, caps));
+
+  // The banner is the line that survives into scrollback saying which account
+  // you got. It belongs to a CHOICE, not to every launch: on the pass-through
+  // path `claude <args>` must be as quiet as it was before cam existed, or
+  // every scripted `claude -p …` grows a line of stderr it never had. So print
+  // it when the user actually picked this run, when they named an account
+  // explicitly, or when the account is not the one they used last — the three
+  // cases where the answer is not already obvious to them.
+  // `last !== profile.name` covers the first run too: with no `last` file yet,
+  // null never equals a profile name, so the banner shows once and then the
+  // path goes quiet.
+  const announce = target.kind === 'pick'
+    || namedExplicitly(ctx, parsed.camName)
+    || last !== profile.name;
+  if (announce) note(ctx, ui.banner(profile, caps));
 
   // 9 — remember the choice before the spawn, so Ctrl+C still counts.
   try {

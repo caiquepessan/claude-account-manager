@@ -46,10 +46,7 @@ import {
   status as shellStatus,
   install as shellInstall,
   uninstall as shellUninstall,
-  writeRuntime,
-  renderPosixStub,
-  renderPowerShell,
-  renderFish
+  writeRuntime
 } from '../shell.js';
 
 /** Width of the label column in the rendered report. */
@@ -924,39 +921,33 @@ export async function cmdDoctor(ctx, args) {
 // ── cam shell ─────────────────────────────────────────────────────────────
 
 /**
- * Render the block text a target would receive, without writing anything.
- * @param {object} ctx the cam context
- * @param {{ shell: string, file: string }} target one shell rc target
- * @param {{ version: string, camBin: string, runtimePath: string }} vars render inputs
- * @returns {string} the exact text `cam shell install` would write into that file
- */
-function previewFor(ctx, target, vars) {
-  const shell = String(target.shell || '');
-  if (shell === 'powershell' || shell === 'pwsh') {
-    return renderPowerShell(ctx, { version: vars.version, camBin: vars.camBin });
-  }
-  if (shell === 'fish') {
-    return renderFish(ctx, { version: vars.version, camBin: vars.camBin });
-  }
-  return renderPosixStub(ctx, { version: vars.version, runtimePath: vars.runtimePath });
-}
-
-/**
  * Translate a shell.js result action into its catalogue label.
  * @param {object} ctx the cam context
  * @param {string} action one of installed|updated|unchanged|removed|absent|notfound
  * @returns {string} the translated label
  */
 function actionLabel(ctx, action) {
+  // These names come from src/shell.js and are the ONLY ones it emits:
+  // created | appended | upgraded | unchanged | removed | absent | not-installed.
+  // An earlier version of this switch invented 'installed' and 'updated', which
+  // no code path produces, so every successful install fell through to the
+  // default and reported "not installed" — after correctly writing the file.
   switch (String(action || '').toLowerCase()) {
+    case 'created':
+    case 'appended':
     case 'installed': return ctx.t('shell.installed');
+    case 'upgraded':
     case 'updated': return ctx.t('shell.updated');
     case 'unchanged': return ctx.t('shell.unchanged');
     case 'removed': return ctx.t('shell.removed');
-    case 'absent': return ctx.t('shell.absent');
+    case 'absent':
+    case 'not-installed': return ctx.t('shell.absent');
     default: return ctx.t('shell.absent');
   }
 }
+
+/** The actions that mean cam successfully changed a file. */
+const WROTE_ACTIONS = new Set(['created', 'appended', 'upgraded', 'installed', 'updated', 'removed']);
 
 /**
  * `cam shell install|uninstall|status` — the driver for src/shell.js.
@@ -1043,13 +1034,20 @@ export async function cmdShell(ctx, args) {
   if (action === 'install') {
     const paths = storePaths(ctx);
     const camBin = ctx.argv0 || 'cam';
-    const runtimePath = join(paths.shellDir, ctx.platform === 'win32' ? 'cam.ps1' : 'cam.sh');
-    const vars = { version: ctx.version, camBin, runtimePath };
 
     if (dryRun) {
-      for (const target of targets) {
-        lines.push(t('shell.target', { shell: target.shell, file: target.file || target.path || '' }));
-        lines.push(previewFor(ctx, target, vars));
+      // Ask the installer itself what it would write, rather than re-deriving
+      // it here. A second implementation of the per-shell selection is exactly
+      // how this preview came to show every target the POSIX stub pointing at
+      // cam.ps1 — and a --dry-run that lies about what it will do to your rc
+      // file is worse than having no --dry-run at all.
+      const preview = await shellInstall(ctx, targets, {
+        version: ctx.version, camBin, dryRun: true
+      });
+      for (const r of preview || []) {
+        if (!r || typeof r.preview !== 'string') continue;
+        lines.push(t('shell.target', { shell: r.shell, file: r.file || r.path || '' }));
+        lines.push(r.preview);
         lines.push('');
       }
       lines.push(statusLine('info', t('shell.dryRun'), caps));
@@ -1070,7 +1068,7 @@ export async function cmdShell(ctx, args) {
     const results = await shellInstall(ctx, targets, { version: ctx.version, camBin, dryRun: false });
     for (const r of results || []) {
       const file = r.file || r.path || '';
-      lines.push(statusLine(r.action === 'installed' || r.action === 'updated' ? 'ok' : 'info',
+      lines.push(statusLine(WROTE_ACTIONS.has(String(r.action)) ? 'ok' : 'info',
         `${t('shell.target', { shell: r.shell, file })}  ${actionLabel(ctx, r.action)}`, caps));
       if (r.backup) lines.push(`  ${t('shell.backup', { file: r.backup })}`);
     }

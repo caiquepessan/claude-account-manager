@@ -334,6 +334,56 @@ describe('architecture', () => {
     }
     assert.ok(seen.has('launch'));
   });
+
+  // REGRESSION: src/shell.js reports what it did with `created` / `appended` /
+  // `upgraded`, but doctor.js's actionLabel used to switch on invented names
+  // ('installed', 'updated') that no code path emits. Every real action fell
+  // through to the default and `cam shell install` reported "not installed"
+  // after correctly writing the rc file — the tool doing the right thing and
+  // telling the user it had not. Two vocabularies in two files, so a source
+  // scan is the only thing that keeps them honest.
+  it('doctor.actionLabel handles every action src/shell.js can emit', () => {
+    const shellSrc = readFileSync(new URL('../src/shell.js', import.meta.url), 'utf8');
+    const doctorSrc = readFileSync(new URL('../src/commands/doctor.js', import.meta.url), 'utf8');
+
+    const emitted = new Set(
+      [...shellSrc.matchAll(/\baction:\s*'([a-z-]+)'/g)].map((m) => m[1])
+    );
+    // Ternaries such as `action: cur === null ? 'created' : 'upgraded'` put the
+    // names after the colon, so pick those up too.
+    for (const m of shellSrc.matchAll(/\baction:[^,\n]*\?[^,\n]*/g)) {
+      for (const q of m[0].matchAll(/'([a-z-]+)'/g)) emitted.add(q[1]);
+    }
+    assert.ok(emitted.size >= 5, `expected shell.js to emit several actions, saw ${[...emitted]}`);
+
+    const handled = new Set(
+      [...doctorSrc.matchAll(/case\s+'([a-z-]+)':/g)].map((m) => m[1])
+    );
+    const unhandled = [...emitted].filter((a) => !handled.has(a)).sort();
+    assert.deepEqual(unhandled, [],
+      `src/shell.js emits actions doctor.js does not name explicitly: ${unhandled.join(', ')}`);
+
+    // And the inverse: a case for a name nothing emits is dead code that hides
+    // the next drift exactly like this one did.
+    const invented = [...handled]
+      .filter((a) => !emitted.has(a) && a !== 'installed' && a !== 'updated')
+      .sort();
+    assert.deepEqual(invented, [],
+      `doctor.js names actions src/shell.js never emits: ${invented.join(', ')}`);
+  });
+
+  it('every action that changed a file is reported as a success, not as absent', () => {
+    const doctorSrc = readFileSync(new URL('../src/commands/doctor.js', import.meta.url), 'utf8');
+    const m = doctorSrc.match(/const WROTE_ACTIONS = new Set\(\[([^\]]*)\]\)/);
+    assert.ok(m, 'WROTE_ACTIONS is gone; the ok/info decision has drifted back to literals');
+    const wrote = new Set([...m[1].matchAll(/'([a-z-]+)'/g)].map((x) => x[1]));
+    for (const a of ['created', 'appended', 'upgraded', 'removed']) {
+      assert.ok(wrote.has(a), `${a} writes a file but is not counted as a success`);
+    }
+    for (const a of ['unchanged', 'absent', 'not-installed']) {
+      assert.equal(wrote.has(a), false, `${a} changes nothing and must not read as a success`);
+    }
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
