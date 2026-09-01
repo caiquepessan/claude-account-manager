@@ -637,3 +637,79 @@ describe('this suite cannot reach the real home', () => {
     assert.equal(needle.test(src), false, 'this test file reads the real home');
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The reserved `default` row counts as an account for the duplicate check
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe('cam add — signing in as the account already used as `default`', () => {
+  /**
+   * Point the machine's ambient login at the same account the fake `claude
+   * auth login` will produce, so the new profile really is a duplicate of the
+   * `default` row.
+   * @param {string} root the sandbox home
+   * @returns {void}
+   */
+  const makeDefaultSameAsLogin = (root) => {
+    fs.writeFileSync(path.join(root, '.claude.json'), `${JSON.stringify({
+      userID: 'default-user-id',
+      hasCompletedOnboarding: true,
+      oauthAccount: {
+        accountUuid: 'uuid-work',
+        emailAddress: 'work@example.com',
+        organizationName: 'Work Org',
+        organizationType: 'claude_max',
+        organizationUuid: 'org-fake-1',
+      },
+    }, null, 2)}\n`, 'utf8');
+  };
+
+  it('says so, naming `default`, instead of creating a silent second row', async () => {
+    // findDuplicate used to search profiles.list() AND skip anything without a
+    // `dir`, so the reserved default row was excluded twice over: you could
+    // sign in as the account you already use ambiently and end up with two
+    // identical rows in the picker and no warning at all.
+    const sb = addSandbox('dup-default');
+    makeDefaultSameAsLogin(sb.root);
+
+    const code = await account.cmdAdd(sb.ctx, ['mine', '--no-share']);
+    assert.equal(code, EXIT.OK, sb.io.err.text());
+
+    const errText = sb.io.err.text();
+    assertHasFolded(errText, sb.t('add.dupTitle', { name: 'default' }), errText);
+
+    // It is a notice, not a veto: giving the ambient account a managed profile
+    // is how you stop depending on `default`, so the profile is still created.
+    assert.ok(
+      fs.existsSync(path.join(sb.store, 'profiles', 'mine', '.cam-meta.json')),
+      'the profile was not created',
+    );
+  });
+
+  it('never offers to replace `default`, which cannot be trashed', async () => {
+    const sb = addSandbox('dup-default-noreplace');
+    makeDefaultSameAsLogin(sb.root);
+
+    assert.equal(await account.cmdAdd(sb.ctx, ['mine', '--no-share']), EXIT.OK, sb.io.err.text());
+
+    const errText = sb.io.err.text();
+    assert.equal(
+      errText.includes(sb.t('add.dupChoices', { name: 'default' })),
+      false,
+      'offered [r] replace "default" — trashProfile refuses the reserved account',
+    );
+    assert.equal(errText.includes(sb.t('add.dupReplaced', { name: 'default' })), false);
+  });
+
+  it('still asks when the duplicate is an ordinary profile', async () => {
+    // The control: profile-vs-profile keeps the keep/replace/cancel prompt.
+    const sb = addSandbox('dup-profile');
+    assert.equal(await account.cmdAdd(sb.ctx, ['first', '--no-share']), EXIT.OK, sb.io.err.text());
+    sb.io.err.clear?.();
+
+    const before = sb.io.err.text();
+    await account.cmdAdd(sb.ctx, ['second', '--no-share']);
+    const errText = sb.io.err.text().slice(before.length);
+    assertHasFolded(errText, sb.t('add.dupTitle', { name: 'first' }), errText);
+  });
+});

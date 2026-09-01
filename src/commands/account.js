@@ -555,12 +555,15 @@ function reportUnsafe(ctx, caps, detail) {
 async function findDuplicate(ctx, name, accountUuid, fingerprint) {
   let existing = [];
   try {
-    existing = await profiles.list(ctx);
+    // `all`, not `list`: the reserved `default` row is an account like any
+    // other in the menu, so signing in again as the account you already use
+    // ambiently produced two identical rows and no warning at all.
+    existing = await profiles.all(ctx);
   } catch {
     return null;
   }
   for (const p of existing) {
-    if (!p || p.name === name || !p.dir) continue;
+    if (!p || p.name === name) continue;
     const m = metaOf(p);
     if (accountUuid && uuidOf(p) && uuidOf(p) === accountUuid) return p;
     if (fingerprint && m.tokenFingerprint && m.tokenFingerprint === fingerprint) return p;
@@ -753,7 +756,15 @@ export async function cmdAdd(ctx, args) {
 
     // ── 7. one Claude account should not become two rows ─────────────────
     const dup = await findDuplicate(ctx, name, accountUuid, fingerprint);
-    if (dup) {
+    // The reserved `default` row is a duplicate worth NAMING but not worth
+    // interrupting for: it cannot be replaced (trashProfile refuses it), and
+    // giving the account you currently use ambiently a managed profile of its
+    // own is the normal way to stop depending on `default` at all. So say it
+    // and carry on, rather than asking a question with only one real answer.
+    if (dup && !dup.dir) {
+      err(ctx, '');
+      say(ctx, caps, 'info', ctx.t('add.dupTitle', { name: dup.name }));
+    } else if (dup) {
       err(ctx, '');
       say(ctx, caps, 'warn', ctx.t('add.dupTitle', { name: dup.name }));
       const choice = await (async () => {
