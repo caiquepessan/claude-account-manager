@@ -208,6 +208,25 @@ const ZERO_WIDTH_RE = /[\p{Mn}\p{Me}\p{Cf}]/u;
  * @param {string} s any raw text
  * @returns {string} printable 7-bit ASCII, with everything else replaced by '?'
  */
+/**
+ * Fold a line that may ALREADY be styled down to 7-bit, when the terminal asked
+ * for it. `asciify` is deliberately hostile to escape bytes — it turns them into
+ * '?' — so it can only be given raw text. This applies it per non-ASCII
+ * character instead, which leaves any SGR sequence (all of it ASCII) intact.
+ *
+ * It exists because `--ascii` promises 7-bit output and the one-line summaries
+ * of `cam ls`, `cam which` and `cam doctor` are written straight to the stream
+ * rather than through the frame builders, so `·` and `→` used to survive.
+ * @param {string} text a line, styled or not
+ * @param {object} [caps] terminal capabilities; folding happens only when caps.ascii
+ * @returns {string} the line, 7-bit when asked for, unchanged otherwise
+ */
+export function plain(text, caps) {
+  const s = text === undefined || text === null ? '' : String(text);
+  if (!caps || caps.ascii !== true) return s;
+  return s.replace(/[^\x00-\x7f]/gu, (ch) => asciify(ch));
+}
+
 export function asciify(s) {
   if (s === undefined || s === null) return '';
   const text = String(s);
@@ -656,6 +675,10 @@ const DAY_MS = 86400000;
 /**
  * Human-readable age of a timestamp. The clock is injected: this module never
  * reads one of its own.
+ *
+ * ALWAYS PASS `ctx.t`. The default exists only for callers that have no context
+ * at all (a unit test, a crash path); every string it produces is English, so an
+ * omitted translator silently prints 'just now' inside a pt-BR session.
  * @param {number} ms the timestamp being described, in epoch milliseconds
  * @param {number} now the current time, from ctx.now()
  * @param {Function} [t] a bound translator; the English catalogue by default

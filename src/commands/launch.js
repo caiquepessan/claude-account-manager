@@ -7,6 +7,8 @@ import {
   EXIT,
   fail,
   HOSTILE_ENV,
+  dropCamPins,
+  envValue,
   sanitizeChildEnv as sanitizeChildEnvFallback,
   describeAmbient as describeAmbientFallback
 } from '../ctx.js';
@@ -53,7 +55,9 @@ const WHICH_LABEL = 14;
  * @returns {void}
  */
 function out(ctx, text) {
-  ctx.io.out.write(`${text}\n`);
+  // `--ascii` promises 7-bit output, and these one-line summaries bypass the
+  // frame builders that would otherwise fold them, so they fold here.
+  ctx.io.out.write(`${ui.plain(text, tty.writeCaps(ctx, ctx.io.out))}\n`);
 }
 
 /**
@@ -64,7 +68,7 @@ function out(ctx, text) {
  * @returns {void}
  */
 function note(ctx, text) {
-  ctx.io.err.write(`${text}\n`);
+  ctx.io.err.write(`${ui.plain(text, tty.writeCaps(ctx, ctx.io.err))}\n`);
 }
 
 /**
@@ -242,17 +246,25 @@ function readArgs(args) {
 
 /**
  * Build the child environment, preferring the sanitizer hung on ctx.
+ * The pin sweep is finished here rather than in the sanitizer: the reserved
+ * `default` account returns its environment byte-for-byte, which is deliberate
+ * for the user's own CLAUDE_* variables but not for cam's own CAM_PROFILE /
+ * CAM_ACCOUNT / CAM_TTY — a nested `claude` inheriting one of those resolves to
+ * a DIFFERENT account than the session it was started from.
  * @param {object} ctx the injected context
  * @param {{ profile: object, keepEnv?: boolean }} opts the profile and keep-env switch
- * @returns {{ env: Record<string, string|undefined>, stripped: object[], notes: unknown[] }} the sanitised result
+ * @returns {{ env: Record<string, string|undefined>, stripped: object[], notes: unknown[], kept: object[] }} the sanitised result
  */
 function sanitize(ctx, opts) {
   const fn = typeof ctx.sanitizeChildEnv === 'function' ? ctx.sanitizeChildEnv : sanitizeChildEnvFallback;
   const result = fn(ctx, opts) || {};
+  const env = result.env && typeof result.env === 'object' ? result.env : { ...ctx.env };
+  dropCamPins(ctx, env);
   return {
-    env: result.env && typeof result.env === 'object' ? result.env : { ...ctx.env },
+    env,
     stripped: Array.isArray(result.stripped) ? result.stripped : [],
-    notes: Array.isArray(result.notes) ? result.notes : []
+    notes: Array.isArray(result.notes) ? result.notes : [],
+    kept: Array.isArray(result.kept) ? result.kept : []
   };
 }
 
@@ -304,7 +316,35 @@ function identityLine(ctx, profile) {
  */
 function namedExplicitly(ctx, camName) {
   if (typeof camName === 'string' && camName !== '' && camName !== ASK_SENTINEL) return true;
-  return ['CAM_PROFILE', 'CAM_ACCOUNT'].some((n) => typeof ctx.env[n] === 'string' && ctx.env[n].trim() !== '');
+  return ['CAM_PROFILE', 'CAM_ACCOUNT'].some((n) => envText(ctx, n) !== null);
+}
+
+/**
+ * Read a cam switch out of the environment, case-insensitively on Windows.
+ * `ctx.env` is a plain copy of the real environment, so a lower-cased
+ * `cam_profile` — the same variable to Windows — is invisible to `ctx.env.X`.
+ * @param {object} ctx the injected context
+ * @param {string} name the canonical variable name
+ * @returns {string|null} the trimmed value, or null when unset or blank
+ */
+function envText(ctx, name) {
+  const raw = envValue(ctx, name);
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim();
+  return value === '' ? null : value;
+}
+
+/**
+ * Join the short reason and its detail into one sentence. Either half may be
+ * empty — there is no catalogue key yet for "the first account on the list", and
+ * an empty half must not render as a stray `(…)` or a leading separator.
+ * @param {string} short the headline reason
+ * @param {string} detail the parenthesised elaboration
+ * @returns {string} the joined reason, possibly empty
+ */
+function joinReason(short, detail) {
+  if (short && detail) return `${short} (${detail})`;
+  return short || detail || '';
 }
 
 /**
@@ -354,20 +394,35 @@ function classifyItem(item, accounts) {
 }
 
 /**
- * Report every environment variable cam removed and every note the sanitizer
- * raised. Nothing is ever removed silently: a user who set one meant it.
+ * Report every environment variable cam removed, every one it deliberately let
+ * through, and every note the sanitizer raised. Nothing is ever removed
+ * silently: a user who set one meant it. And nothing that OUTRANKS the account
+ * cam just chose is silent either — on the `default` account and under
+ * --keep-env the variable survives and decides the session, so the banner alone
+ * would be a lie by omission.
  * @param {object} ctx the injected context
  * @param {object} caps terminal capabilities
- * @param {{ stripped: object[], notes: unknown[], keepEnv: boolean }} result the sanitizer output
+ * @param {{ stripped: object[], notes: unknown[], keepEnv: boolean, kept?: object[] }} result the sanitizer output
  * @returns {void}
  */
-function reportEnv(ctx, caps, { stripped, notes, keepEnv }) {
+function reportEnv(ctx, caps, { stripped, notes, keepEnv, kept }) {
   const said = new Set();
   for (const entry of stripped) {
     const name = typeof entry === 'string' ? entry : (entry && entry.name);
     if (!name) continue;
     const impact = (entry && typeof entry === 'object' && maybeT(ctx, entry.impact)) || impactFor(ctx, name);
     const line = ctx.t('launch.stripped', { name, impact });
+    if (said.has(line)) continue;
+    said.add(line);
+    warnLine(ctx, caps, line);
+  }
+  for (const entry of Array.isArray(kept) ? kept : []) {
+    const name = typeof entry === 'string' ? entry : (entry && entry.name);
+    if (!name) continue;
+    const impact = (entry && typeof entry === 'object' && maybeT(ctx, entry.impact)) || impactFor(ctx, name);
+    // Says plainly that cam is NOT removing this one and that the account named
+    // in the banner below may therefore not be the one that actually runs.
+    const line = impact ? ctx.t('launch.kept', { name, impact }) : name;
     if (said.has(line)) continue;
     said.add(line);
     warnLine(ctx, caps, line);
@@ -445,7 +500,9 @@ async function healProfile(ctx, caps, { profile, health, claudeBin }) {
     warnLine(ctx, caps, ctx.t('launch.healSignedOut', { name: profile.name }));
   } else {
     const at = typeof meta.refreshTokenExpiresAt === 'number' ? meta.refreshTokenExpiresAt : null;
-    const ago = at ? ui.relativeTime(at, ctx.now()) : (health.label || '');
+    // ui.relativeTime defaults to the English catalogue, so the translator has
+    // to be passed explicitly or a pt-BR session prints "4 days ago" mid-sentence.
+    const ago = at ? ui.relativeTime(at, ctx.now(), ctx.t) : (health.label || '');
     warnLine(ctx, caps, ctx.t('launch.healExpired', { name: profile.name, ago }));
   }
   note(ctx, `  ${ctx.t('launch.healAction')}`);
@@ -523,7 +580,10 @@ export function resolveTarget(ctx, opts = {}) {
   const mode = opts.mode && typeof opts.mode === 'object' ? opts.mode : { kind: 'none', reason: '' };
   const camName = typeof opts.camName === 'string' && opts.camName !== '' ? opts.camName : null;
   const names = accounts.map((p) => p.name);
-  const find = (n) => accounts.find((p) => p.name === n) || null;
+  // Case-insensitive, exactly like profiles.get(): profile directory names are
+  // always lower-cased by validName, so `cam use Work` resolves and `--cam Work`
+  // must too. An exact match here made the hot path the only place that failed.
+  const find = (n) => accounts.find((p) => String(p.name).toLowerCase() === String(n).toLowerCase()) || null;
   const unknown = (n) => fail('NOT_FOUND', ctx.t('err.notFound', { name: n }), {
     hint: ctx.t('err.notFoundHint', { names: names.join(', ') })
   });
@@ -539,10 +599,9 @@ export function resolveTarget(ctx, opts = {}) {
   const forcedAsk = camName === ASK_SENTINEL;
 
   // b — CAM_PROFILE / CAM_ACCOUNT.
-  const envVar = ['CAM_PROFILE', 'CAM_ACCOUNT']
-    .find((n) => typeof ctx.env[n] === 'string' && ctx.env[n].trim() !== '') || null;
+  const envVar = ['CAM_PROFILE', 'CAM_ACCOUNT'].find((n) => envText(ctx, n) !== null) || null;
   if (!forcedAsk && envVar) {
-    const wanted = ctx.env[envVar].trim();
+    const wanted = envText(ctx, envVar);
     const hit = find(wanted);
     if (!hit) unknown(wanted);
     const short = ctx.t('which.reason.env', { var: envVar, name: wanted });
@@ -564,14 +623,10 @@ export function resolveTarget(ctx, opts = {}) {
     : (typeof config.last === 'string' && config.last !== '' ? config.last : null);
   let profile = null;
   let short = '';
-  if (last) {
-    const hit = find(last);
-    if (hit) {
-      profile = hit;
-      short = ctx.t('which.reason.last');
-    } else {
-      note(ctx, `${ctx.t('launch.prefix')} ${ctx.t('launch.lastMissing', { name: last })}`);
-    }
+  const lastHit = last ? find(last) : null;
+  if (lastHit) {
+    profile = lastHit;
+    short = ctx.t('which.reason.last');
   }
   if (!profile && real.length === 1) {
     profile = real[0];
@@ -579,12 +634,31 @@ export function resolveTarget(ctx, opts = {}) {
   }
   if (!profile) {
     profile = fallback || accounts[0] || null;
-    short = ctx.t('which.reason.default');
+    // `which.reason.default` names the reserved default login, so it may only be
+    // used when that is what was actually chosen. With no default row this is
+    // just the first account on the list, and claiming "your existing Claude
+    // Code login" describes an account that does not exist in this store; the
+    // truthful label for anything else is "the first account on the list".
+    short = profile && !profile.dir
+      ? ctx.t('which.reason.default')
+      : ctx.t('which.reason.first');
+  }
+  // The "last account is gone" notice is emitted only now, because it names what
+  // happens next: `launch.lastMissing` hardcodes the word "default", which is
+  // true only when the fallback really is the reserved default account.
+  if (last && !lastHit) {
+    const missing = profile && !profile.dir
+      ? ctx.t('launch.lastMissing', { name: last })
+      : ctx.t('launch.lastMissingProfile', {
+        name: last,
+        fallback: profile ? profile.name : '',
+      });
+    note(ctx, `${ctx.t('launch.prefix')} ${missing}`);
   }
 
   // d — may cam ask, and does it want to?
   const ask = normalizeAsk(flags.ask)
-    || normalizeAsk(ctx.env.CAM_ASK)
+    || normalizeAsk(envValue(ctx, 'CAM_ASK'))
     || normalizeAsk(config.ask)
     || 'auto';
   const canAsk = mode.kind === 'raw' || mode.kind === 'line';
@@ -600,7 +674,14 @@ export function resolveTarget(ctx, opts = {}) {
     const detail = (forcedAsk || ask === 'always')
       ? ctx.t('which.reason.detailAskAlways', { n: accounts.length })
       : ctx.t('which.reason.detailAsk', { n: accounts.length });
-    return { kind: 'pick', profile, reason: `${short} (${detail})`, short, detail, chain: [short, detail] };
+    return {
+      kind: 'pick',
+      profile,
+      reason: joinReason(short, detail),
+      short,
+      detail,
+      chain: [short, detail].filter(Boolean)
+    };
   }
 
   let detail;
@@ -611,7 +692,7 @@ export function resolveTarget(ctx, opts = {}) {
   return {
     kind: 'launch',
     profile,
-    reason: detail ? `${short} (${detail})` : short,
+    reason: joinReason(short, detail),
     short,
     detail,
     chain: [short, detail].filter(Boolean)
@@ -630,7 +711,7 @@ export function resolveTarget(ctx, opts = {}) {
 export async function run(ctx, args) {
   const parsed = readArgs(args);
   const { forwarded, flags } = parsed;
-  const keepEnv = flagOn(flags, 'keep-env', 'keepEnv') || isTruthy(ctx.env.CAM_KEEP_ENV);
+  const keepEnv = flagOn(flags, 'keep-env', 'keepEnv') || isTruthy(envValue(ctx, 'CAM_KEEP_ENV'));
   const caps = tty.detectCaps(ctx, ctx.io.err);
 
   // 1 — the list, with no subprocess and no network.
@@ -672,7 +753,8 @@ export async function run(ctx, args) {
   } else if (mode.kind === 'none' && accounts.length > 1 && !namedExplicitly(ctx, parsed.camName)) {
     // Silence here is the failure mode this program exists to avoid — but a
     // user who typed --cam already knows which account they asked for.
-    const why = `${target.short}; ${reasonText(ctx, mode.reason)}`;
+    const modeWhy = reasonText(ctx, mode.reason);
+    const why = target.short ? `${target.short}; ${modeWhy}` : modeWhy;
     const prefix = ctx.t('launch.prefix');
     note(ctx, `${prefix} ${ctx.t('launch.using', { name: profile.name, reason: why })}`);
     note(ctx, `${' '.repeat(prefix.length + 1)}${ctx.t('launch.switchHint')}`);
@@ -691,7 +773,12 @@ export async function run(ctx, args) {
 
   // 7 — the child environment, with every removal reported.
   const sanitized = sanitize(ctx, { profile, keepEnv });
-  reportEnv(ctx, caps, { stripped: sanitized.stripped, notes: sanitized.notes, keepEnv });
+  reportEnv(ctx, caps, {
+    stripped: sanitized.stripped,
+    notes: sanitized.notes,
+    kept: sanitized.kept,
+    keepEnv
+  });
 
   // 8 — hand the terminal back before anything else can touch it.
   screen.restoreCursorSync();
@@ -817,7 +904,7 @@ export async function cmdWhich(ctx, args) {
   const { flags, forwarded } = parsed;
   const verbose = flagOn(flags, 'verbose', 'v') || ctx.verbose === true;
   const asJson = flagOn(flags, 'json');
-  const keepEnv = flagOn(flags, 'keep-env', 'keepEnv') || isTruthy(ctx.env.CAM_KEEP_ENV);
+  const keepEnv = flagOn(flags, 'keep-env', 'keepEnv') || isTruthy(envValue(ctx, 'CAM_KEEP_ENV'));
 
   const accounts = await profiles.all(ctx);
   const config = await profiles.loadConfig(ctx);
@@ -834,11 +921,20 @@ export async function cmdWhich(ctx, args) {
   });
   const profile = target.profile;
   if (!profile) {
-    fail('NOT_FOUND', ctx.t('err.noAccounts'), { hint: ctx.t('err.noAccountsHint') });
+    // The message is the no-accounts pair, so the code must be too: `cam launch`
+    // and `cam use` both answer 6 for this exact state, and `cam help` publishes
+    // the table a setup script branches on.
+    fail('NO_ACCOUNTS', ctx.t('err.noAccounts'), { hint: ctx.t('err.noAccountsHint') });
   }
 
   const sanitized = sanitize(ctx, { profile, keepEnv });
   const configDir = sanitized.env ? sanitized.env.CLAUDE_CONFIG_DIR : undefined;
+  // What cam WILL do, not what describeAmbient can see: on the reserved default
+  // account sanitizeChildEnv removes nothing at all, so "cam would remove it"
+  // was a written promise cam never kept.
+  const strippedNames = new Set(sanitized.stripped
+    .map((entry) => (typeof entry === 'string' ? entry : (entry && entry.name)))
+    .filter(Boolean));
   const bin = claude.resolveClaude(ctx, { claudeBin: config.claudeBin });
   const kindKey = `which.kind.${bin.kind === 'exe' || bin.kind === 'cmd' || bin.kind === 'script' ? bin.kind : 'unknown'}`;
   const present = ambientRows(ctx).filter((row) => row && row.present);
@@ -861,7 +957,11 @@ export async function cmdWhich(ctx, args) {
       claudeKind: bin.kind,
       keepEnv,
       forwarded,
-      ambient: present.map((row) => ({ name: row.name, hostile: !!row.hostile }))
+      ambient: present.map((row) => ({
+        name: row.name,
+        hostile: !!row.hostile,
+        stripped: strippedNames.has(row.name)
+      }))
     }, null, 2));
     return EXIT.OK;
   }
@@ -883,9 +983,16 @@ export async function cmdWhich(ctx, args) {
       out(ctx, `${label('which.ambient')}${ctx.t('which.ambientNone')}`);
     } else {
       present.forEach((row, i) => {
-        const text = keepEnv
-          ? ctx.t('which.ambientKept', { name: row.name })
-          : ctx.t('which.ambientSet', { name: row.name });
+        let text;
+        if (strippedNames.has(row.name)) text = ctx.t('which.ambientSet', { name: row.name });
+        else if (keepEnv && row.hostile) text = ctx.t('which.ambientKept', { name: row.name });
+        // Anything else survives into the child: the reserved default account,
+        // and the report-only variables cam never touches. Say so outright
+        // rather than promising a removal that will not happen — an earlier
+        // version printed "cam would remove it for this session" here, which
+        // was simply false for the default account.
+        else if (row.hostile) text = ctx.t('which.ambientPassed', { name: row.name });
+        else text = row.impact ? `${row.name}: ${row.impact}` : row.name;
         out(ctx, `${i === 0 ? label('which.ambient') : cont}${text}`);
       });
     }
@@ -1025,6 +1132,12 @@ function targetKind(ctx, file, override) {
   if (ext === '.ps1' || ext === '.sh' || ext === '.js' || ext === '.mjs' || ext === '.cjs' || ext === '.py') {
     return { file, kind: 'script' };
   }
+  // On Windows an extensionless command means a PATHEXT lookup, and libuv's own
+  // PATH search only appends .com and .exe — so every .cmd shim (npm, npx, yarn,
+  // pnpm, tsc, eslint) failed ENOENT and `cam exec` answered a bare 127. Route
+  // them through ComSpec, which is what claude.classifyKind already answers for
+  // an extensionless path on win32.
+  if (ext === '' && ctx.isWindows === true) return { file, kind: 'script' };
   return { file, kind: 'exe' };
 }
 
@@ -1060,9 +1173,14 @@ export async function cmdExec(ctx, args) {
   }
 
   const config = await profiles.loadConfig(ctx);
-  const keepEnv = flagOn(parsed.flags, 'keep-env', 'keepEnv') || isTruthy(ctx.env.CAM_KEEP_ENV);
+  const keepEnv = flagOn(parsed.flags, 'keep-env', 'keepEnv') || isTruthy(envValue(ctx, 'CAM_KEEP_ENV'));
   const sanitized = sanitize(ctx, { profile, keepEnv });
-  reportEnv(ctx, caps, { stripped: sanitized.stripped, notes: sanitized.notes, keepEnv });
+  reportEnv(ctx, caps, {
+    stripped: sanitized.stripped,
+    notes: sanitized.notes,
+    kept: sanitized.kept,
+    keepEnv
+  });
 
   const spawnTarget = targetKind(ctx, command[0], config.claudeBin);
   const startedAt = ctx.now();
@@ -1070,6 +1188,13 @@ export async function cmdExec(ctx, args) {
     env: sanitized.env,
     kind: spawnTarget.kind
   });
+  // A child that never started reports code null with exitCode 127; a child that
+  // ran and chose to exit 127 reports code 127. Only the first is cam's to
+  // explain, and it used to be explained with nothing at all.
+  if (result && result.code === null && result.exitCode === EXIT.NO_CLAUDE) {
+    warnLine(ctx, caps, ctx.t('exec.notFound', { cmd: command[0] }));
+    note(ctx, `  ${ctx.t('err.hintLabel')}: ${ctx.t('err.errorHint')}`);
+  }
   await syncBack(ctx, caps, profile, ctx.now() - startedAt);
   return exitCodeOf(result);
 }

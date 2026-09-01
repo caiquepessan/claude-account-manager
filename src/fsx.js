@@ -268,6 +268,34 @@ export async function backupOnce(ctx, file) {
 }
 
 /**
+ * The path a write must actually land on. A dotfiles-managed rc file
+ * (`~/.zshrc` -> `~/dotfiles/zshrc` under stow, chezmoi or yadm) is a SYMLINK,
+ * and renaming a temp file onto the link path replaces the LINK with a plain
+ * file: the repository copy is silently orphaned, still shows clean in
+ * `git status`, and every later edit the user makes there stops reaching their
+ * shell. Resolving first makes the rename land on the real file, so the link
+ * survives every install, upgrade and uninstall.
+ * @param {string} file - The requested destination.
+ * @returns {Promise<string>} The real file to write, or `file` when it is no link.
+ */
+async function resolveWriteTarget(file) {
+  const st = await lstatOrNull(file);
+  if (!st || !st.isSymbolicLink()) return file;
+  try {
+    return path.resolve(await fsp.realpath(file));
+  } catch {
+    // A dangling link: follow it one hop by hand so the write creates the file
+    // the link promises instead of destroying the link to make room.
+    try {
+      const to = await fsp.readlink(file);
+      return path.isAbsolute(to) ? path.resolve(to) : path.resolve(path.dirname(file), to);
+    } catch {
+      return file;
+    }
+  }
+}
+
+/**
  * rename with the bounded retry loop. Verified necessary: on Windows, renaming
  * over a file another process holds open fails EPERM where POSIX succeeds.
  * @param {string} from - Source path.
@@ -320,11 +348,14 @@ async function fsyncDir(ctx, dir) {
 }
 
 /**
- * The one durable write in the program: optional one-time backup, temp file in
- * the SAME directory, fsync, chmod on POSIX, rename with bounded retry, then a
- * POSIX-only directory fsync. On any failure the temp file is removed and the
- * original is left untouched. Refuses outright to target ~/.claude.json,
- * ~/.claude/.claude.json or ~/.claude/.credentials.json.
+ * The one durable write in the program: a symlinked destination is resolved to
+ * the file it points at (so a dotfiles-managed rc file keeps its link), then
+ * optional one-time backup, temp file in the SAME directory as the resolved
+ * file, fsync, chmod on POSIX, rename with bounded retry, then a POSIX-only
+ * directory fsync. On any failure the temp file is removed and the original is
+ * left untouched. Refuses outright to target ~/.claude.json,
+ * ~/.claude/.claude.json or ~/.claude/.credentials.json — before AND after
+ * resolution, so a symlink can never be a way to write through to them.
  * @param {object} ctx - The cam context.
  * @param {string} file - Destination path.
  * @param {string|Uint8Array} data - Bytes to write.
@@ -341,11 +372,16 @@ export async function writeFileAtomic(ctx, file, data, opts = {}) {
 
   assertNotClaudeOwned(ctx, file);
 
-  const dir = path.dirname(file);
-  if (doBackupOnce) await backupOnce(ctx, file);
+  const target = await resolveWriteTarget(file);
+  // The guard runs again on the resolved path: without it a symlink named
+  // anything at all would be a way to write through to the Claude-owned files.
+  if (target !== file) assertNotClaudeOwned(ctx, target);
+
+  const dir = path.dirname(target);
+  if (doBackupOnce) await backupOnce(ctx, target);
 
   const pid = Number.isInteger(ctx?.pid) ? ctx.pid : process.pid;
-  const tmp = path.join(dir, `${path.basename(file)}.cam-${pid}-${randomBytes(3).toString('hex')}.tmp`);
+  const tmp = path.join(dir, `${path.basename(target)}.cam-${pid}-${randomBytes(3).toString('hex')}.tmp`);
 
   let handle = null;
   try {
@@ -365,7 +401,7 @@ export async function writeFileAtomic(ctx, file, data, opts = {}) {
     handle = null;
 
     await chmodIfPosix(ctx, tmp, mode);
-    await renameWithRetry(tmp, file, retries, baseDelayMs);
+    await renameWithRetry(tmp, target, retries, baseDelayMs);
   } catch (err) {
     if (handle) {
       try {

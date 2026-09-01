@@ -62,8 +62,20 @@ Add a test with your change. `node --test` runs everything.
 
 macOS is verified at runtime rather than assumed: `cam add` first proves that two
 config directories are genuinely isolated on your machine and refuses to create a
-second account if they are not. If you have a Mac and can run the manual gate in
-`test/` on real hardware, that report is a genuinely useful contribution.
+second account if they are not. The test suite cannot check that — it never
+touches a real Keychain, and the `keychain` tests in `pure.test.js` only cover
+the service-name derivation against a fake `ctx`. So the check that matters on
+macOS only ever runs on someone's actual Mac.
+
+If you have one, the genuinely useful contribution is the output of
+
+```bash
+CAM_HOME=/tmp/cam-scratch node bin/cam.js doctor --deep --json
+```
+
+filed as an issue, with your macOS version and how Claude Code was installed. The
+`isolation` and `credentials` rows are the ones being verified. Please redact
+paths you would rather not publish; the report contains no token material.
 
 Windows behaviour worth knowing when reviewing: `rename` over an open file fails
 with `EPERM` where POSIX succeeds (hence the retry loop), directory `fsync`

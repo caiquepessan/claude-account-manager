@@ -123,7 +123,7 @@ Everyday:
 | `cam add [name]` | Sign in with another account. Flags: `--console`, `--sso`, `--email <addr>`, `--no-share`, `--no-seed`, `--share-projects`, `--keep`. |
 | `cam ls` | List your accounts, plans, orgs and token health. `--json` for machine output. Alias: `cam list`. |
 | `cam use [name]` | Set the account bare `claude` uses. With no name and a terminal, it opens the picker. |
-| `cam rm <name>` | Quarantine an account into `trash/`. `--yes` to skip the typed confirmation, `--purge` to delete instead of quarantine. |
+| `cam rm <name>` | Quarantine an account into `trash/`. `--yes` to skip the typed confirmation, `--purge` to delete outright instead — no undo, and on macOS it deletes that account's Keychain item too. |
 | `cam shell install\|uninstall\|status` | Install, remove or inspect the `claude` shell hook. `--dry-run` prints the diff, `--shell <id>` limits it to one shell. |
 | `cam doctor` | Check every assumption on this machine. `--deep` re-runs the isolation self-test, `--fix` applies the repairs marked safe, `--json` for machine output. |
 | `cam help [command]` | Help. `--all` also lists the advanced commands. |
@@ -192,8 +192,8 @@ Ctrl+C  Ctrl+D ........ cancel                           exit 130
 ```
 
 You do not have to install the hook. `cam launch`, `cam exec` and `cam env`
-work on their own, and `cam shell uninstall` removes the block and restores the
-backup it took.
+work on their own, and `cam shell uninstall` takes the block back out, leaving
+the rest of each file byte-for-byte intact.
 
 ## How it works
 
@@ -205,20 +205,26 @@ variable on the one `claude` child process it spawns. Claude Code then does all
 credential handling itself, inside that directory, exactly as it always has —
 so a token it refreshes mid-session is written straight back to the account it
 belongs to, and there is no stored copy anywhere that can go stale. The reserved
-`default` account is the exception that makes this safe to install: its
-directory is `null` and it launches with **no** `CLAUDE_CONFIG_DIR` set at all,
-so the child environment is byte-for-byte what you have today. `cam` never
-writes to `~/.claude.json`, `~/.claude/.claude.json` or
+`default` account is the exception that makes this safe to install: it has no
+directory of its own, so `cam` sets **no** `CLAUDE_CONFIG_DIR` for it and hands
+the child your environment completely untouched — byte-for-byte what you have
+today. That includes a `CLAUDE_CONFIG_DIR` you set yourself: `cam` keeps it and
+prints `respecting your CLAUDE_CONFIG_DIR` rather than overriding you. `cam`
+never writes to `~/.claude.json`, `~/.claude/.claude.json` or
 `~/.claude/.credentials.json`, and there is no code path in it that opens a
 credentials file for writing.
 
 Five variables silently outrank `CLAUDE_CONFIG_DIR`. Left in place, every
-profile would resolve to the same account while `cam` reported success, so
-`cam` removes them from that one child process and prints a line saying it did
-— `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`,
-`SELF_HOSTED_RUNNER_HOST_CONFIG_DIR`, `CLAUDE_CODE_ACCOUNT_UUID` and
-`CLAUDE_CODE_ORGANIZATION_UUID`. Pass `--keep-env` when one of them is your
-intended credential.
+profile would resolve to the same account while `cam` reported success, so for a
+`cam`-managed account `cam` removes them from that one child process and prints
+a line saying it did — `CLAUDE_CODE_OAUTH_TOKEN`,
+`CLAUDE_SECURESTORAGE_CONFIG_DIR`, `SELF_HOSTED_RUNNER_HOST_CONFIG_DIR`,
+`CLAUDE_CODE_ACCOUNT_UUID` and `CLAUDE_CODE_ORGANIZATION_UUID`. Pass
+`--keep-env` when one of them is your intended credential. The `default` account
+is again the exception, and deliberately so: nothing is stripped from it,
+because "untouched" is the whole promise. If one of those five is set in your
+shell, `default` runs as *that* credential rather than your `~/.claude` login.
+Unset it, or pick a named account, where `cam` does enforce the choice.
 
 ## What is shared and what is not
 
@@ -249,11 +255,15 @@ creation saying `--resume` can then load another account's session.
 Full detail, including the exact list of files written and the threat model, is
 in [SECURITY.md](SECURITY.md). The three things worth knowing here:
 
-- **`cam` never reads or writes a token.** There is no code path that opens
-  `.credentials.json` for writing. The only things it ever reads out of one are
-  the expiry timestamps behind the "expires in 4d" warning and a truncated
-  SHA-256 fingerprint used to notice that two profiles are the same account.
-  Token strings are never logged and never written to a file `cam` creates.
+- **`cam` never reads or writes a token value.** There is no code path that
+  opens `.credentials.json` for writing. What it reads out of one is small and
+  fixed: the two expiry timestamps behind the "expires in 4d" warning, the
+  subscription type and scope list, whether an access token is present at all,
+  any unexpected top-level key names, and a 12-hex SHA-256 fingerprint of the
+  refresh token used to notice that two profiles are the same account. No token
+  string is ever logged or written to a file `cam` creates. (The subscription
+  type *is* cached, as the plan shown in `cam ls`, in the profile's own
+  `.cam-meta.json`.)
 - **Each account's credentials stay wherever Claude Code puts them.** On Linux
   and Windows that is a plaintext `.credentials.json` inside the profile
   directory; on macOS it is the login Keychain, namespaced per config directory.
@@ -264,7 +274,10 @@ in [SECURITY.md](SECURITY.md). The three things worth knowing here:
 - **Removing an account does not revoke the session.** `cam rm` moves a local
   directory into `trash/`. The session stays valid on Anthropic's side until you
   sign it out at claude.ai → Settings → Sessions. `cam rm` tells you this every
-  time, and `cam restore <name>` undoes the removal.
+  time, and `cam restore <name>` undoes the removal. `cam rm --purge` does not
+  move anything: it deletes the profile directory outright, and on macOS also
+  deletes that profile's login Keychain item, which `cam restore` cannot bring
+  back. It still does not revoke the session.
 
 This tool is for switching between accounts you already own. It is not a way to
 share one account with other people; that is against Anthropic's terms.
@@ -294,8 +307,10 @@ from real macOS use are welcome.
 ## FAQ
 
 **Does this touch my existing login?** No. It becomes the `default` row in the
-menu and launches with no `CLAUDE_CONFIG_DIR` at all — byte-for-byte the
-behaviour you had before installing `cam`.
+menu, and `cam` adds no `CLAUDE_CONFIG_DIR` of its own and changes nothing else
+in the environment — byte-for-byte the behaviour you had before installing
+`cam`. If you already set `CLAUDE_CONFIG_DIR` yourself, `default` still uses it;
+`cam` reports that rather than overriding you.
 
 **Does `cam` see my password?** No. Adding an account hands the terminal to
 Claude Code's own `claude auth login`. `cam` never handles a password, never
@@ -368,11 +383,15 @@ cam config claudeBin "C:\path\to\claude.exe"
 `cam doctor` lists all the candidate paths.
 
 **`CLAUDE_CODE_OAUTH_TOKEN was set in your environment`.** That variable is a
-complete auth bypass: it outranks every account, so `cam` removes it from the
-session it spawns and tells you it did. If it is genuinely the credential you
-want — a CI job, for instance — pass `--keep-env` (or set `CAM_KEEP_ENV=1`) and
-`cam` will warn that account selection is not being enforced. It is never
-stripped silently, and never stripped from your own shell.
+complete auth bypass: it outranks every account, so when you launch a
+`cam`-managed account `cam` removes it from the session it spawns and tells you
+it did. If it is genuinely the credential you want — a CI job, for instance —
+pass `--keep-env` (or set `CAM_KEEP_ENV=1`) and `cam` will warn that account
+selection is not being enforced. It is never stripped silently, and never
+stripped from your own shell. The reserved `default` account is not touched at
+all, so with this variable exported `default` runs as the token's account rather
+than your `~/.claude` login; unset it, or pick a named account, if that is not
+what you want.
 
 **`Can't safely add a second account on this machine`** (exit 8). A throwaway
 config directory reported that it is already signed in, so isolation does not
@@ -380,8 +399,14 @@ hold. The usual cause is `CLAUDE_SECURESTORAGE_CONFIG_DIR` being set. Unset it
 and run `cam doctor`.
 
 **The output is mangled or misaligned.** `CAM_ASCII=1` (or `--ascii`) forces
-7-bit output for every glyph, separator and ellipsis; `NO_COLOR=1` (or
-`--no-color`) drops colour. The layout is identical either way.
+7-bit output for every glyph, separator, arrow and ellipsis `cam` prints —
+the picker, the tables, the status lines and the plain summary lines alike;
+`NO_COLOR=1` (or `--no-color`) drops colour. The layout is identical either way.
+Colour is kept when you fold to ASCII, because the two switches are independent.
+
+Folding is opt-in and never triggered by redirection: piping `cam ls` into a
+file keeps its UTF-8, so an accented email or organisation name survives. Only a
+terminal that reports it cannot draw unicode gets folded on its own.
 
 **A `%VARIABLE%` in a prompt comes out expanded, on Windows only.** If your
 Claude Code was installed with `npm i -g`, the entry point is `claude.cmd`, and
@@ -407,7 +432,10 @@ rm -rf ~/.claude-account-manager      # optional: deletes the extra accounts
 ```
 
 `cam shell uninstall` removes the managed block from every shell file it wrote
-to and restores the backup it took first.
+to, leaving the rest of each file byte-for-byte intact. Before it edits a file
+it copies it to `<file>.cam-backup-<ISO>`, exactly as `cam shell install` does.
+Nothing is ever restored *from* those copies — they are there for you to read or
+roll back by hand, one per edit, and they are yours to delete.
 
 Your original Claude Code login is untouched throughout, because it was never
 moved. Deleting `~/.claude-account-manager` deletes the *other* accounts' config

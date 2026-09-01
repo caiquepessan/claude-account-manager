@@ -1064,7 +1064,7 @@ export async function selectLine(ctx, screen, opts = {}) {
  * The only entry point commands use; returns null when cam may not ask at all.
  * @param {any} ctx the injected context
  * @param {any} screen a screen from createScreen
- * @param {{ items?: any[], index?: number, mode?: {kind:string,reason:string}, forwarded?: string[] }} opts rows, cursor and an optional precomputed interactivity
+ * @param {{ items?: any[], index?: number, mode?: {kind:string,reason:string}, forwarded?: string[], allowAdd?: boolean }} opts rows, cursor, an optional precomputed interactivity, and whether to offer "add an account"
  * @returns {Promise<any|null>} the chosen row, or null
  */
 export async function pick(ctx, screen, opts = {}) {
@@ -1072,8 +1072,18 @@ export async function pick(ctx, screen, opts = {}) {
   if (!mode || typeof mode.kind !== 'string') {
     mode = interactivity(ctx, { forwarded: Array.isArray(opts.forwarded) ? opts.forwarded : [] });
   }
-  if (mode.kind === 'raw') return select(ctx, screen, opts);
-  if (mode.kind === 'line') return selectLine(ctx, screen, opts);
+  // `allowAdd` is the caller's word for "offer an add row", but select(),
+  // selectLine() and ui.buildMenu all look for an actual row (isAdd / showAdd).
+  // Nothing translated the one into the other, so the footer advertised `a add`
+  // over a menu that had no add row and ignored the key. Materialise it here,
+  // appended last and skipped by `hot`, so the digit hotkeys keep their numbers.
+  let full = opts;
+  const items = Array.isArray(opts.items) ? opts.items : [];
+  if (opts.allowAdd === true && !items.some(isAdd)) {
+    full = { ...opts, items: items.concat([{ kind: 'add' }]), showAdd: true };
+  }
+  if (mode.kind === 'raw') return select(ctx, screen, full);
+  if (mode.kind === 'line') return selectLine(ctx, screen, full);
   return null;
 }
 

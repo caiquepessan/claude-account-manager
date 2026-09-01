@@ -267,6 +267,43 @@ function envSet(env, name, value, insensitive) {
 }
 
 /**
+ * Read one variable out of a context's environment, case-insensitively on
+ * Windows. `ctx.env` is a plain spread copy of process.env, which throws away
+ * the OS's case-blind resolution: `$env:cam_profile='work'` is the SAME variable
+ * as CAM_PROFILE to Windows but a different key in the copy. Every module that
+ * reads a cam switch must come through here or it silently misses the pin.
+ * @param {Readonly<Record<string, any>>} ctx the context
+ * @param {string} name canonical variable name
+ * @returns {string|undefined} the value, or undefined when absent
+ */
+export function envValue(ctx, name) {
+  const env = (ctx && ctx.env) || {};
+  return envGet(env, name, Boolean(ctx && ctx.isWindows === true));
+}
+
+/**
+ * Drop cam's own pins from a child environment.
+ * sanitizeChildEnv clears PIN_ENV for every real profile, but the reserved
+ * `default` account returns before that loop so its environment stays
+ * byte-for-byte pre-cam. The nested-session guarantee is not about cam's own
+ * behaviour towards the user's environment, though: a child must never inherit
+ * a stale pin, whichever account launched it, so the launcher applies this to
+ * the environment it is about to spawn with.
+ * @param {Readonly<Record<string, any>>} ctx the context
+ * @param {Record<string, string|undefined>} env the child environment (mutated)
+ * @returns {string[]} the names actually removed
+ */
+export function dropCamPins(ctx, env) {
+  const insensitive = Boolean(ctx && ctx.isWindows === true);
+  const target = env && typeof env === 'object' ? env : {};
+  const removed = [];
+  for (const pin of PIN_ENV) {
+    if (envDelete(target, pin.name, insensitive)) removed.push(pin.name);
+  }
+  return removed;
+}
+
+/**
  * Redact anything token-shaped: first 12 characters and last 4, nothing more.
  * A secret must never reach a log line, a JSON dump or a doctor report.
  * @param {string} name variable name
@@ -363,9 +400,12 @@ export function createCtx(overrides = {}) {
  * would be a regression cam introduced. For a real profile, CLAUDE_CONFIG_DIR
  * and CAM_ACTIVE are set, every hostile override is removed, and cam's own pins
  * are dropped. The caller MUST print one line per `stripped` entry: never silent.
+ * `kept` is the mirror of that promise — a hostile variable that survives into
+ * the child (the default account, or --keep-env) decides the account INSTEAD of
+ * the name cam is about to print, so the caller must report those too.
  * @param {Readonly<Record<string, any>>} ctx the context
  * @param {{ profile?: { name?: string, dir?: string|null }|null, keepEnv?: boolean }} [opts] target profile and --keep-env
- * @returns {{ env: Record<string, string|undefined>, stripped: Array<{ name: string, impact: string, key: string }>, notes: string[] }} child env, what was removed, what to tell the user
+ * @returns {{ env: Record<string, string|undefined>, stripped: Array<{ name: string, impact: string, key: string }>, notes: string[], kept: Array<{ name: string, impact: string, key: string }> }} child env, what was removed, what to tell the user, what still overrides the choice
  */
 export function sanitizeChildEnv(ctx, opts = {}) {
   const o = opts && typeof opts === 'object' ? opts : {};
@@ -377,6 +417,9 @@ export function sanitizeChildEnv(ctx, opts = {}) {
   const stripped = [];
   /** @type {string[]} */
   const notes = [];
+  /** @type {Array<{ name: string, impact: string, key: string }>} */
+  const kept = [];
+  const record = (item) => kept.push({ name: item.name, impact: ctx.t(item.impact), key: item.impact });
 
   const dir = profile && typeof profile.dir === 'string' && profile.dir ? profile.dir : null;
 
@@ -384,7 +427,13 @@ export function sanitizeChildEnv(ctx, opts = {}) {
     if (envGet(env, 'CLAUDE_CONFIG_DIR', insensitive) !== undefined) {
       notes.push(ctx.t('launch.respectConfigDir'));
     }
-    return { env, stripped, notes };
+    // The pass-through stays byte-for-byte, but it must not be SILENT: an
+    // ambient CLAUDE_CODE_OAUTH_TOKEN runs the session as whatever account it
+    // belongs to while the banner names the default login. Report, never strip.
+    for (const item of HOSTILE_ENV) {
+      if (envGet(env, item.name, insensitive) !== undefined) record(item);
+    }
+    return { env, stripped, notes, kept };
   }
 
   envSet(env, 'CLAUDE_CONFIG_DIR', dir, insensitive);
@@ -394,7 +443,10 @@ export function sanitizeChildEnv(ctx, opts = {}) {
 
   if (keepEnv) {
     notes.push(ctx.t('launch.keepEnv'));
-    return { env, stripped, notes };
+    for (const item of HOSTILE_ENV) {
+      if (envGet(env, item.name, insensitive) !== undefined) record(item);
+    }
+    return { env, stripped, notes, kept };
   }
 
   for (const item of HOSTILE_ENV) {
@@ -403,7 +455,7 @@ export function sanitizeChildEnv(ctx, opts = {}) {
     stripped.push({ name: item.name, impact: ctx.t(item.impact), key: item.impact });
   }
 
-  return { env, stripped, notes };
+  return { env, stripped, notes, kept };
 }
 
 /**

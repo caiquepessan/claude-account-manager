@@ -123,7 +123,7 @@ Do dia a dia:
 | `cam add [nome]` | Entrar com outra conta. Opções: `--console`, `--sso`, `--email <endereço>`, `--no-share`, `--no-seed`, `--share-projects`, `--keep`. |
 | `cam ls` | Listar contas, planos, organizações e validade do login. `--json` para saída de máquina. Apelido: `cam list`. |
 | `cam use [nome]` | Definir a conta que o `claude` sozinho usa. Sem nome e com terminal, abre o menu. |
-| `cam rm <nome>` | Colocar uma conta em quarentena, na pasta `trash/`. `--yes` pula a confirmação digitada, `--purge` apaga em vez de colocar em quarentena. |
+| `cam rm <nome>` | Colocar uma conta em quarentena, na pasta `trash/`. `--yes` pula a confirmação digitada, `--purge` apaga de vez em vez disso — sem desfazer, e no macOS apaga também o item do Keychain daquela conta. |
 | `cam shell install\|uninstall\|status` | Instalar, remover ou inspecionar o hook do `claude` no shell. `--dry-run` mostra o que mudaria, `--shell <id>` limita a um shell. |
 | `cam doctor` | Checar cada suposição nesta máquina. `--deep` refaz o teste de isolamento, `--fix` aplica os reparos marcados como seguros, `--json` para saída de máquina. |
 | `cam help [comando]` | Ajuda. `--all` também lista os comandos avançados. |
@@ -193,8 +193,8 @@ Ctrl+C  Ctrl+D ........ cancelar                         saída 130
 ```
 
 Instalar o hook é opcional. `cam launch`, `cam exec` e `cam env` funcionam
-sozinhos, e o `cam shell uninstall` remove o bloco e restaura o backup que ele
-tirou antes.
+sozinhos, e o `cam shell uninstall` tira o bloco de volta, deixando o resto de
+cada arquivo byte a byte como estava.
 
 ## Como funciona
 
@@ -207,19 +207,27 @@ próprio Claude Code que cuida das credenciais, dentro daquela pasta, exatamente
 como sempre fez — então um token renovado no meio da sessão é gravado direto na
 conta a que pertence, e não existe nenhuma cópia guardada em outro lugar para
 ficar desatualizada. A conta reservada `default` é a exceção que torna isso
-seguro de instalar: a pasta dela é `null` e ela inicia **sem** nenhum
-`CLAUDE_CONFIG_DIR` definido, então o ambiente do processo filho é byte a byte o
-que você já tem hoje. O `cam` nunca escreve em `~/.claude.json`,
-`~/.claude/.claude.json` ou `~/.claude/.credentials.json`, e não existe nele
-nenhum caminho de código que abra um arquivo de credenciais para escrita.
+seguro de instalar: ela não tem pasta própria, então o `cam` **não** define
+nenhum `CLAUDE_CONFIG_DIR` para ela e entrega ao processo filho o seu ambiente
+completamente intocado — byte a byte o que você já tem hoje. Isso inclui um
+`CLAUDE_CONFIG_DIR` que você mesmo tenha definido: o `cam` mantém e imprime
+`respeitando seu CLAUDE_CONFIG_DIR` em vez de passar por cima. O `cam` nunca
+escreve em `~/.claude.json`, `~/.claude/.claude.json` ou
+`~/.claude/.credentials.json`, e não existe nele nenhum caminho de código que
+abra um arquivo de credenciais para escrita.
 
 Cinco variáveis silenciosamente valem mais que o `CLAUDE_CONFIG_DIR`. Se
 ficassem no lugar, todo perfil resolveria para a mesma conta enquanto o `cam`
-reportasse sucesso — então o `cam` remove cada uma daquele processo filho e
-imprime uma linha dizendo que removeu: `CLAUDE_CODE_OAUTH_TOKEN`,
-`CLAUDE_SECURESTORAGE_CONFIG_DIR`, `SELF_HOSTED_RUNNER_HOST_CONFIG_DIR`,
-`CLAUDE_CODE_ACCOUNT_UUID` e `CLAUDE_CODE_ORGANIZATION_UUID`. Use `--keep-env`
-quando uma delas for justamente a credencial que você quer.
+reportasse sucesso — então, ao iniciar uma conta gerenciada pelo `cam`, ele
+remove cada uma daquele processo filho e imprime uma linha dizendo que removeu:
+`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`,
+`SELF_HOSTED_RUNNER_HOST_CONFIG_DIR`, `CLAUDE_CODE_ACCOUNT_UUID` e
+`CLAUDE_CODE_ORGANIZATION_UUID`. Use `--keep-env` quando uma delas for justamente
+a credencial que você quer. A conta `default` é de novo a exceção, e de
+propósito: nada é removido dela, porque "intocado" é a promessa inteira. Se uma
+dessas cinco estiver definida no seu shell, a `default` roda como *aquela*
+credencial, e não como o seu login do `~/.claude`. Remova a variável, ou escolha
+uma conta com nome, onde o `cam` garante a escolha.
 
 ## O que é compartilhado e o que não é
 
@@ -251,12 +259,15 @@ copiados. O `cam add --no-seed` pula o estado de máquina herdado.
 O detalhe completo, incluindo a lista exata de arquivos escritos e o modelo de
 ameaça, está no [SECURITY.md](SECURITY.md). As três coisas que importam aqui:
 
-- **O `cam` nunca lê nem escreve um token.** Não existe caminho de código que
-  abra o `.credentials.json` para escrita. As únicas coisas que ele chega a ler
-  de um são os carimbos de validade por trás do aviso "expira em 4d" e uma
-  impressão SHA-256 truncada, usada para perceber que dois perfis são a mesma
-  conta. Tokens nunca vão para log e nunca são gravados em arquivo que o `cam`
-  crie.
+- **O `cam` nunca lê nem escreve o valor de um token.** Não existe caminho de
+  código que abra o `.credentials.json` para escrita. O que ele chega a ler de um
+  é pouco e fixo: os dois carimbos de validade por trás do aviso "expira em 4d",
+  o tipo de assinatura e a lista de escopos, se existe ou não um token de acesso,
+  os nomes das chaves de primeiro nível inesperadas, e uma impressão SHA-256 de
+  12 caracteres do token de renovação, usada para perceber que dois perfis são a
+  mesma conta. Nenhum token vai para log nem é gravado em arquivo que o `cam`
+  crie. (O tipo de assinatura *é* guardado, como o plano que aparece no `cam ls`,
+  no `.cam-meta.json` do próprio perfil.)
 - **As credenciais de cada conta ficam onde o Claude Code as coloca.** No Linux e
   no Windows, isso é um `.credentials.json` em texto puro dentro da pasta do
   perfil; no macOS, é o Keychain de login, com um nome por pasta de configuração.
@@ -267,7 +278,10 @@ ameaça, está no [SECURITY.md](SECURITY.md). As três coisas que importam aqui:
 - **Remover uma conta não encerra a sessão.** O `cam rm` move uma pasta local
   para `trash/`. A sessão continua válida do lado da Anthropic até você
   encerrá-la em claude.ai → Settings → Sessions. O `cam rm` avisa isso todas as
-  vezes, e o `cam restore <nome>` desfaz a remoção.
+  vezes, e o `cam restore <nome>` desfaz a remoção. O `cam rm --purge` não move
+  nada: ele apaga a pasta do perfil de vez e, no macOS, apaga também o item do
+  Keychain daquele perfil, que o `cam restore` não tem como trazer de volta.
+  Mesmo assim, não encerra a sessão.
 
 Esta ferramenta serve para alternar entre contas que já são suas. Não é uma forma
 de dividir uma conta com outras pessoas; isso vai contra os termos da Anthropic.
@@ -297,9 +311,11 @@ uso real no macOS são bem-vindos.
 
 ## Perguntas frequentes
 
-**Isso mexe no meu login atual?** Não. Ele vira a linha `default` do menu e
-inicia sem nenhum `CLAUDE_CONFIG_DIR` — byte a byte o comportamento que você
-tinha antes de instalar o `cam`.
+**Isso mexe no meu login atual?** Não. Ele vira a linha `default` do menu, e o
+`cam` não acrescenta nenhum `CLAUDE_CONFIG_DIR` próprio nem muda mais nada no
+ambiente — byte a byte o comportamento que você tinha antes de instalar o `cam`.
+Se você já define `CLAUDE_CONFIG_DIR` por conta própria, a `default` continua
+usando o seu; o `cam` avisa em vez de passar por cima.
 
 **O `cam` vê a minha senha?** Não. Adicionar uma conta entrega o terminal ao
 `claude auth login` do próprio Claude Code. O `cam` nunca lida com senha, nunca
@@ -374,11 +390,15 @@ cam config claudeBin "C:\caminho\para\claude.exe"
 O `cam doctor` lista todos os caminhos candidatos.
 
 **`CLAUDE_CODE_OAUTH_TOKEN` definida no ambiente.** Essa variável é um desvio
-completo da autenticação: ela vale mais que qualquer conta, então o `cam` a
-remove da sessão que inicia e avisa que removeu. Se ela for mesmo a credencial
-que você quer — em um job de CI, por exemplo — use `--keep-env` (ou defina
-`CAM_KEEP_ENV=1`) e o `cam` avisa que a escolha de conta não está sendo garantida.
-Ela nunca é removida em silêncio, e nunca é removida do seu shell.
+completo da autenticação: ela vale mais que qualquer conta, então, ao iniciar uma
+conta gerenciada pelo `cam`, ele a remove da sessão que inicia e avisa que
+removeu. Se ela for mesmo a credencial que você quer — em um job de CI, por
+exemplo — use `--keep-env` (ou defina `CAM_KEEP_ENV=1`) e o `cam` avisa que a
+escolha de conta não está sendo garantida. Ela nunca é removida em silêncio, e
+nunca é removida do seu shell. A conta reservada `default` não é tocada de jeito
+nenhum: com essa variável exportada, a `default` roda como a conta do token, e
+não como o seu login do `~/.claude`. Remova a variável, ou escolha uma conta com
+nome, se não é isso que você quer.
 
 **`Não dá para adicionar uma segunda conta com segurança nesta máquina`**
 (saída 8). Uma pasta de configuração descartável reportou que já está conectada,
@@ -386,8 +406,14 @@ ou seja, o isolamento não vale. A causa comum é a variável
 `CLAUDE_SECURESTORAGE_CONFIG_DIR` estar definida. Remova-a e rode o `cam doctor`.
 
 **A saída sai quebrada ou desalinhada.** `CAM_ASCII=1` (ou `--ascii`) força saída
-7-bit para todo símbolo, separador e reticência; `NO_COLOR=1` (ou `--no-color`)
-tira a cor. O layout é idêntico dos dois jeitos.
+7-bit para todo símbolo, separador, seta e reticência que o `cam` imprime — menu,
+tabelas, linhas de status e linhas simples de resumo, tudo; `NO_COLOR=1` (ou
+`--no-color`) tira a cor. O layout é idêntico dos dois jeitos. A cor continua
+quando você dobra para ASCII, porque as duas opções são independentes.
+
+A dobra é opt-in e nunca é disparada por redirecionamento: mandar o `cam ls` para
+um arquivo preserva o UTF-8, então um e-mail ou nome de organização com acento
+sobrevive. Só um terminal que declara não saber desenhar unicode dobra sozinho.
 
 **Um `%VARIÁVEL%` no prompt chega expandido — só no Windows.** Se o seu Claude
 Code foi instalado com `npm i -g`, o ponto de entrada é um `claude.cmd`, e um
@@ -414,7 +440,11 @@ rm -rf ~/.claude-account-manager      # opcional: apaga as contas extras
 ```
 
 O `cam shell uninstall` remove o bloco gerenciado de todo arquivo de shell em que
-escreveu e restaura o backup que tirou antes.
+escreveu, deixando o resto de cada arquivo byte a byte como estava. Antes de
+mexer em um arquivo ele copia para `<arquivo>.cam-backup-<ISO>`, exatamente como
+o `cam shell install` faz. Nada é restaurado *a partir* dessas cópias — elas
+ficam ali para você ler ou desfazer na mão, uma por edição, e são suas para
+apagar.
 
 O seu login original do Claude Code fica intacto o tempo todo, porque ele nunca
 saiu do lugar. Apagar o `~/.claude-account-manager` apaga as pastas de

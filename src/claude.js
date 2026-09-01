@@ -12,9 +12,11 @@ import { storePaths } from './profiles.js';
 
 /**
  * The signal handlers installed around an inherited-stdio child belong to THIS
- * process, not to the child, and `ctx` has no slot for them. Reached through
- * `globalThis` so this file still names no ambient environment, platform or
- * stdio global of any kind — every one of those comes from `ctx`.
+ * process, not to the child, and `ctx` has no slot for them. `execPath` — the
+ * node that must start a `.js` target on Windows — is the same kind of fact
+ * about the running interpreter rather than about the user's machine. Both are
+ * reached through `globalThis` so this file still names no ambient environment,
+ * platform or stdio global of any kind — every one of those comes from `ctx`.
  */
 const runtime = globalThis.process;
 
@@ -199,9 +201,19 @@ function pathDirs(ctx) {
  * ~/.claude/local/node_modules/.bin, the platform package-manager locations, then
  * a PATH scan. `npm prefix -g` is deliberately NOT consulted: 299 ms measured, and
  * it needs shell:true on Windows because npm is npm.cmd.
+ *
+ * CAM_CLAUDE_BIN and config.claudeBin are PINS, not merely the first candidates:
+ * a pin that does not resolve stops the search and reports nothing found. Falling
+ * through to auto-discovery would silently run a DIFFERENT claude than the one the
+ * user pinned — a different version, possibly a different account behaviour — and
+ * `cam doctor` would then describe that binary as if it were the configured one.
+ * A typo, or an install under a directory named `claude-account-manager` (which
+ * `looksLikeCam` rejects), is exactly how that happens. CLAUDE_CODE_EXECPATH is
+ * NOT a pin: it is ambient state inherited from a parent Claude Code process, not
+ * a choice the user made, so a stale one still falls through.
  * @param {object} ctx cam context
  * @param {{ config?: object|null, claudeBin?: string|null }} [opts] configured override
- * @returns {{ path: string|null, kind: 'exe'|'cmd'|'script'|'unknown', tried: string[] }} the winner plus every location examined
+ * @returns {{ path: string|null, kind: 'exe'|'cmd'|'script'|'unknown', tried: string[], pinned: string[] }} the winner, every location examined, and the pins that failed
  */
 export function resolveClaude(ctx, opts = {}) {
   const tried = [];
@@ -210,11 +222,19 @@ export function resolveClaude(ctx, opts = {}) {
   const home = ctx.home;
 
   const configured = opts.claudeBin || (opts.config && opts.config.claudeBin) || null;
-  const explicit = [envGet(ctx, 'CAM_CLAUDE_BIN'), configured, envGet(ctx, 'CLAUDE_CODE_EXECPATH')];
-  for (const entry of explicit) {
-    if (!entry) continue;
-    const hit = probeCandidate(ctx, absolutize(ctx, String(entry)), tried, seen, { explicit: true });
-    if (hit) return { path: hit, kind: classifyKind(hit, ctx.platform), tried };
+  const pins = [envGet(ctx, 'CAM_CLAUDE_BIN'), configured]
+    .filter((entry) => typeof entry === 'string' && entry !== '')
+    .map((entry) => absolutize(ctx, String(entry)));
+  for (const entry of pins) {
+    const hit = probeCandidate(ctx, entry, tried, seen, { explicit: true });
+    if (hit) return { path: hit, kind: classifyKind(hit, ctx.platform), tried, pinned: [] };
+  }
+  if (pins.length > 0) return { path: null, kind: 'unknown', tried, pinned: pins };
+
+  const inherited = envGet(ctx, 'CLAUDE_CODE_EXECPATH');
+  if (inherited) {
+    const hit = probeCandidate(ctx, absolutize(ctx, String(inherited)), tried, seen, { explicit: true });
+    if (hit) return { path: hit, kind: classifyKind(hit, ctx.platform), tried, pinned: [] };
   }
 
   const dirs = [
@@ -241,15 +261,15 @@ export function resolveClaude(ctx, opts = {}) {
   }
   for (const dir of dirs) {
     const hit = probeCandidate(ctx, join(dir, 'claude'), tried, seen);
-    if (hit) return { path: hit, kind: classifyKind(hit, ctx.platform), tried };
+    if (hit) return { path: hit, kind: classifyKind(hit, ctx.platform), tried, pinned: [] };
   }
 
   for (const dir of pathDirs(ctx)) {
     const hit = probeCandidate(ctx, join(dir, 'claude'), tried, seen);
-    if (hit) return { path: hit, kind: classifyKind(hit, ctx.platform), tried };
+    if (hit) return { path: hit, kind: classifyKind(hit, ctx.platform), tried, pinned: [] };
   }
 
-  return { path: null, kind: 'unknown', tried };
+  return { path: null, kind: 'unknown', tried, pinned: [] };
 }
 
 /**
@@ -267,7 +287,14 @@ export function requireClaude(ctx, opts = {}) {
   const rest = found.tried.length - shown.length;
   let looked = `${ctx.t('launch.noClaudeLooked')} ${shown.join(', ')}`;
   if (rest > 0) looked += ` ${ctx.t('launch.noClaudeMore', { n: rest })}`;
-  const hint = `${ctx.t('err.noClaudeHint')} · ${looked}`;
+  // A pin that failed is the answer, not a footnote: the user named a path and
+  // it could not be used. Leading with it stops them re-reading a list of
+  // locations cam searched instead of fixing the one they configured.
+  const pins = Array.isArray(found.pinned) ? found.pinned : [];
+  const pinNote = pins.length > 0
+    ? `${ctx.t('err.claudeBinPinned', { path: pins.join(', ') })} · `
+    : '';
+  const hint = `${pinNote}${ctx.t('err.noClaudeHint')} · ${looked}`;
 
   try {
     fail('NO_CLAUDE', ctx.t('err.noClaude'), { hint });
@@ -348,11 +375,87 @@ export function quoteForCmd(args) {
 }
 
 /**
+ * The node that must start a `.js`/`.mjs`/`.cjs` target on Windows. `ctx.execPath`
+ * exists so a test can inject one; the running interpreter is the honest default,
+ * because a `claude` shipped as a .js file is a script of THIS node's package.
+ * @param {object} ctx cam context
+ * @returns {string} an absolute node path, or the bare name as a last resort
+ */
+function nodeExecPath(ctx) {
+  if (ctx && typeof ctx.execPath === 'string' && ctx.execPath) return ctx.execPath;
+  return (runtime && runtime.execPath) || 'node';
+}
+
+/**
+ * Find an interpreter by name on PATH (plus, for bash, the Git for Windows
+ * layouts, whose bash.exe is usually NOT on PATH — `Git\cmd` is what installers
+ * add and it holds no shell).
+ * @param {object} ctx cam context
+ * @param {string[]} names bare interpreter names, in preference order
+ * @param {string[]} [extraDirs] additional directories to search first
+ * @returns {string|null} an absolute path, or null when nothing was found
+ */
+function findInterpreter(ctx, names, extraDirs = []) {
+  const tried = [];
+  const seen = new Set();
+  for (const name of names) {
+    for (const dir of [...extraDirs, ...pathDirs(ctx)]) {
+      const hit = probeCandidate(ctx, join(dir, name), tried, seen);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+/**
+ * Route a Windows `script` target to the interpreter that can actually run it.
+ *
+ * cmd.exe CANNOT start a script: it resolves the file through PATHEXT and the
+ * machine's file association, so `.js` runs under whatever `ftype JSFile` says
+ * (WScript.exe by default, which drops every argument, swallows stdout and
+ * exits 0) and `.sh` runs under nothing at all — while cam reports success.
+ * MEASURED on Windows 11: `cmd /d /s /c ""t.sh" hello"` exited 0 and never ran
+ * the script; `""probe.js" hello"` reached Code.exe with `hello` stripped.
+ *
+ * Only `.cmd`/`.bat` and extensionless PATH lookups belong on the ComSpec path;
+ * those are the cases it was measured for. Note that a `.ps1` is still never
+ * *resolved* as the claude binary (see probeCandidate) — this only starts one the
+ * user named explicitly, e.g. through `cam exec`.
+ * @param {object} ctx cam context
+ * @param {string} file the target script
+ * @param {string[]} list arguments, already stringified
+ * @returns {{ file: string, args: string[], extra: object }|null} the spawn triple, or null for "use ComSpec"
+ */
+function winScriptSpec(ctx, file, list) {
+  const ext = extname(String(file || '')).toLowerCase();
+  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') {
+    return { file: nodeExecPath(ctx), args: [file, ...list], extra: {} };
+  }
+  if (ext === '.sh' || ext === '.bash') {
+    const gitDirs = [];
+    for (const root of [envGet(ctx, 'ProgramFiles'), envGet(ctx, 'ProgramFiles(x86)'), envGet(ctx, 'ProgramW6432')]) {
+      if (root) gitDirs.push(join(root, 'Git', 'bin'), join(root, 'Git', 'usr', 'bin'));
+    }
+    const localAppData = envGet(ctx, 'LOCALAPPDATA');
+    if (localAppData) gitDirs.push(join(localAppData, 'Programs', 'Git', 'bin'));
+    // Falling back to the bare name is deliberate: an ENOENT from spawn becomes
+    // exit 127, which is a diagnosis. A silent exit 0 is not.
+    return { file: findInterpreter(ctx, ['bash', 'sh'], gitDirs) || 'bash.exe', args: [file, ...list], extra: {} };
+  }
+  if (ext === '.ps1') {
+    const host = findInterpreter(ctx, ['pwsh', 'powershell']) || 'powershell.exe';
+    return { file: host, args: ['-NoProfile', '-File', file, ...list], extra: {} };
+  }
+  return null;
+}
+
+/**
  * Turn (file, args, kind) into what `ctx.spawn` must actually be given.
  * Node 24 throws EINVAL when a `.cmd`/`.bat` is spawned directly (CVE-2024-27980
  * hardening) and every npm-global Claude Code install on Windows IS `claude.cmd`,
- * so those go through cmd.exe with windowsVerbatimArguments. `shell:true` is
- * never used: it breaks on paths with spaces and emits DEP0190.
+ * so those go through cmd.exe with windowsVerbatimArguments. Script targets never
+ * do — cmd.exe cannot start them (see winScriptSpec). `shell:true` is never used:
+ * it breaks on paths with spaces and emits DEP0190.
  * @param {object} ctx cam context
  * @param {string} file the resolved binary
  * @param {string[]} args arguments
@@ -362,6 +465,11 @@ export function quoteForCmd(args) {
 function spawnSpec(ctx, file, args, kind) {
   const list = Array.isArray(args) ? args.map((a) => String(a)) : [];
   if (isWin(ctx) && kind !== 'exe') {
+    // The extension is the ground truth here, not `kind`: launch.js labels .ps1
+    // 'script' while classifyKind calls it 'unknown', and both must be started
+    // by a real interpreter rather than by a file association.
+    const viaInterpreter = winScriptSpec(ctx, file, list);
+    if (viaInterpreter) return viaInterpreter;
     const comspec = envGet(ctx, 'ComSpec') || 'cmd.exe';
     return {
       file: comspec,

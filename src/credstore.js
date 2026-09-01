@@ -54,6 +54,32 @@ function str(value) {
 }
 
 /**
+ * Read an environment variable the way the OS resolves it. `ctx.env` is a plain
+ * COPY of the real environment, so on Windows it has lost the case-blind lookup
+ * the live environment provides: `$env:claude_config_dir` lands as a lower-case
+ * key that a direct property read misses. ctx.js and claude.js already look
+ * these up case-insensitively, and this module must not disagree with them about
+ * whether an override exists — that disagreement is what let one module report
+ * "respecting your CLAUDE_CONFIG_DIR" while another read the default directory.
+ * POSIX stays case-SENSITIVE, where a differently-cased name is a different
+ * variable that Claude Code does not honour either.
+ * @param {object} ctx the cam context
+ * @param {string} name canonical variable name
+ * @returns {string|undefined} the value, or undefined when absent
+ */
+function envGet(ctx, name) {
+  const env = (ctx && ctx.env) || {};
+  if (Object.prototype.hasOwnProperty.call(env, name)) return env[name];
+  const insensitive = ctx && (ctx.isWindows === true || ctx.platform === 'win32');
+  if (!insensitive) return undefined;
+  const upper = name.toUpperCase();
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === upper) return env[key];
+  }
+  return undefined;
+}
+
+/**
  * Normalize a directory for comparison and hashing: NFC, no trailing separator.
  * @param {string} dir the directory path
  * @returns {string} the normalized path
@@ -70,10 +96,9 @@ function normDir(dir) {
  * @returns {string} the ambient config directory
  */
 function ambientConfigDir(ctx) {
-  const env = ctx.env || {};
-  const sec = env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+  const sec = envGet(ctx, 'CLAUDE_SECURESTORAGE_CONFIG_DIR');
   if (sec !== undefined) return String(sec);
-  return str(env.CLAUDE_CONFIG_DIR) || join(ctx.home, '.claude');
+  return str(envGet(ctx, 'CLAUDE_CONFIG_DIR')) || join(ctx.home, '.claude');
 }
 
 /**
@@ -84,9 +109,8 @@ function ambientConfigDir(ctx) {
  * @returns {boolean} true when dir is ~/.claude with no override in play
  */
 function isDefaultConfigDir(ctx, dir) {
-  const env = ctx.env || {};
-  if (env.CLAUDE_SECURESTORAGE_CONFIG_DIR !== undefined) return false;
-  return samePath(ctx, dir, join(ctx.home, '.claude')) && !str(env.CLAUDE_CONFIG_DIR);
+  if (envGet(ctx, 'CLAUDE_SECURESTORAGE_CONFIG_DIR') !== undefined) return false;
+  return samePath(ctx, dir, join(ctx.home, '.claude')) && !str(envGet(ctx, 'CLAUDE_CONFIG_DIR'));
 }
 
 /**
@@ -135,7 +159,7 @@ function securityKnown(ctx) {
  * @returns {string} the directory holding the credentials file
  */
 function fileCredentialsDir(ctx, configDir) {
-  const sec = str((ctx.env || {}).CLAUDE_SECURESTORAGE_CONFIG_DIR);
+  const sec = str(envGet(ctx, 'CLAUDE_SECURESTORAGE_CONFIG_DIR'));
   if (sec) return sec;
   return str(configDir) || ambientConfigDir(ctx);
 }
@@ -150,15 +174,14 @@ function fileCredentialsDir(ctx, configDir) {
  * @returns {string} the Keychain service name
  */
 export function keychainService(ctx, configDir) {
-  const env = ctx.env || {};
-  const sec = env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+  const sec = envGet(ctx, 'CLAUDE_SECURESTORAGE_CONFIG_DIR');
   const explicit = str(configDir);
   const ambient = ambientConfigDir(ctx);
 
   let isDefaultDir;
   let dir;
   if (explicit === null || samePath(ctx, explicit, ambient)) {
-    isDefaultDir = sec !== undefined ? !sec : !str(env.CLAUDE_CONFIG_DIR);
+    isDefaultDir = sec !== undefined ? !sec : !str(envGet(ctx, 'CLAUDE_CONFIG_DIR'));
     dir = normDir(ambient);
   } else {
     // cam always launches a profile with CLAUDE_CONFIG_DIR=<dir> and with
@@ -167,7 +190,7 @@ export function keychainService(ctx, configDir) {
     dir = normDir(explicit);
   }
 
-  const oauthSuffix = env.CLAUDE_CODE_CUSTOM_OAUTH_URL ? '-custom-oauth' : '';
+  const oauthSuffix = envGet(ctx, 'CLAUDE_CODE_CUSTOM_OAUTH_URL') ? '-custom-oauth' : '';
   return `Claude Code${oauthSuffix}-credentials` + (isDefaultDir ? '' : `-${sha256Hex(dir).slice(0, 8)}`);
 }
 
@@ -178,8 +201,7 @@ export function keychainService(ctx, configDir) {
  * @returns {{kind: 'file'|'keychain'|'credman', label: string, location: string, canRead: boolean, canWrite: boolean, canDelete: boolean, reason?: string}} the backend
  */
 export function detectBackend(ctx, configDir) {
-  const env = ctx.env || {};
-  const secureStorage = str(env.CLAUDE_SECURESTORAGE_CONFIG_DIR);
+  const secureStorage = str(envGet(ctx, 'CLAUDE_SECURESTORAGE_CONFIG_DIR'));
 
   if (ctx.platform === 'darwin' && !secureStorage) {
     const usable = securityKnown(ctx);
@@ -195,7 +217,7 @@ export function detectBackend(ctx, configDir) {
     return backend;
   }
 
-  if (ctx.platform === 'win32' && flagOn(env.CLAUDE_CODE_FORCE_WINDOWS_CREDMAN)) {
+  if (ctx.platform === 'win32' && flagOn(envGet(ctx, 'CLAUDE_CODE_FORCE_WINDOWS_CREDMAN'))) {
     // Claude Code writes a chunked base64 payload under `claude-code-user#m`
     // (metadata {n,l}) plus `#0..#n-1`; cmdkey cannot read secret blobs back, so
     // cam detects and explains this instead of silently doing nothing. `cam add`
@@ -232,6 +254,8 @@ export function detectBackend(ctx, configDir) {
  * guarantees the account picker can never raise a macOS Keychain prompt.
  * No token value is returned, logged or kept: only the four derived numbers,
  * the scope list and a 12-hex fingerprint of the refresh token.
+ * On the file backend it reads the credentials of the directory it was HANDED,
+ * never the one an ambient CLAUDE_SECURESTORAGE_CONFIG_DIR points at.
  * @param {object} ctx the cam context
  * @param {string} configDir the profile's config directory
  * @returns {Promise<{backend: string, unknown?: boolean, hasOauth?: boolean, expiresAt?: number|null, refreshTokenExpiresAt?: number|null, subscriptionType?: string|null, scopes?: string[], fingerprint?: string|null, extraKeys?: string[]}>} the summary
@@ -240,7 +264,17 @@ export async function summary(ctx, configDir) {
   const backend = detectBackend(ctx, configDir);
   if (backend.kind !== 'file') return { backend: backend.kind, unknown: true };
 
-  const raw = await readJsonSafe(ctx, backend.location, null);
+  // Deliberately NOT backend.location when a directory was named: that follows
+  // an ambient CLAUDE_SECURESTORAGE_CONFIG_DIR, and this summary is cached into
+  // the named profile's .cam-meta.json — reading the ambient file would persist
+  // ANOTHER account's expiries, plan and refresh-token fingerprint inside this
+  // profile (making it look expired, and making every profile a "duplicate" of
+  // every other). Same rule remove() states below. With no directory named the
+  // caller is asking about the ambient account, so backend.location is right.
+  const named = str(configDir);
+  const file = named ? join(named, '.credentials.json') : backend.location;
+
+  const raw = await readJsonSafe(ctx, file, null);
   const root = raw && typeof raw === 'object' ? raw : null;
   const extraKeys = root ? Object.keys(root).filter((k) => k !== 'claudeAiOauth') : [];
   const oauth = root && root.claudeAiOauth && typeof root.claudeAiOauth === 'object'

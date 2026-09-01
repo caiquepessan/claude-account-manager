@@ -18,12 +18,17 @@ export const END = '# <<< claude-account-manager <<<';
 /**
  * The managed block, line-anchored (`m`) and NON-GREEDY, absorbing the trailing
  * newline only. Non-greedy is what stops two stray marker pairs from swallowing
- * everything between the first BEGIN and the last END. No `g` flag on purpose:
- * this object is exported and `.test()` on a global regexp is stateful.
- * Capture group 1 is the trailing newline, so a rewrite can put it back byte-exact.
+ * everything between the first BEGIN and the last END. The body additionally
+ * refuses to cross a second BEGIN line: an UNPAIRED BEGIN — left behind by a
+ * hand-edit, or pasted out of the README — would otherwise pair with the real
+ * block's END far below it, and `cam shell uninstall` would delete every line
+ * of the user's own rc file in between. With the lookahead, a match can only
+ * start at the BEGIN that actually opens a block. No `g` flag on purpose: this
+ * object is exported and `.test()` on a global regexp is stateful. Capture
+ * group 1 is the trailing newline, so a rewrite can put it back byte-exact.
  */
 export const blockRe = new RegExp(
-  `^${escapeRe(BEGIN)}[\\s\\S]*?^${escapeRe(END)}[^\\r\\n]*(\\r?\\n)?`,
+  `^${escapeRe(BEGIN)}(?:(?!^${escapeRe(BEGIN)})[\\s\\S])*?^${escapeRe(END)}[^\\r\\n]*(\\r?\\n)?`,
   'm'
 );
 
@@ -413,7 +418,9 @@ export async function conflicts(ctx) {
  * inside a function of an interactive shell replaces the user's shell; and
  * CAM_TTY comes from `[ -t 0 ] && [ -t 2 ]`, because the shell can see the MSYS
  * pty that native Node cannot — that variable is what makes the menu appear in
- * git-bash.
+ * git-bash. A fourth: sh has no scoping, so the function's two variables are
+ * declared `local` (guarded, since `local` is not in POSIX) or they would land
+ * in the user's interactive shell on every single invocation.
  * @param {any} ctx the cam context
  * @param {{ version: string, camBin?: string|null }} opts version stamp and absolute cam path
  * @returns {string} the file contents, LF only
@@ -426,6 +433,11 @@ export function renderPosixRuntime(ctx, { version, camBin = null } = {}) {
     '# Sourced from your rc file by a three-line marker block. Edits here are lost.',
     '',
     'claude() {',
+    '  # An unqualified assignment inside a function is GLOBAL in sh, so without',
+    '  # this line every `claude` call would overwrite the caller\'s own $cam_bin',
+    '  # and $real. bash, zsh, dash and ash all provide `local`; a shell without',
+    '  # it fails this line silently and simply keeps the old global behaviour.',
+    '  local cam_bin real 2>/dev/null || :',
     '  cam_bin=${CAM_BIN:-}',
     '  [ -z "$cam_bin" ] && cam_bin=$( (unset -f cam 2>/dev/null; command -v cam 2>/dev/null) )'
   ];
@@ -485,8 +497,13 @@ function renderPowerShellStub(version, runtimePath) {
 /**
  * The PowerShell runtime, `<root>/shell/cam.ps1`, dot-sourced by the stub.
  * Constraining Get-Command to CommandType Application is what bypasses the
- * function itself and prevents infinite recursion. $LASTEXITCODE is engine
- * global and survives without a $global: prefix.
+ * function itself and prevents infinite recursion. The exit code is captured
+ * inside the `try` and re-published as `$global:LASTEXITCODE` after the CAM_TTY
+ * restore, because a bare `$LASTEXITCODE = …` inside a function would only
+ * create a function-local variable the caller never sees.
+ * `$PSNativeCommandArgumentPassing` is set INSIDE the function: the stub
+ * dot-sources this file, so a file-scope assignment would land in the user's
+ * global session and change argument quoting for every native command they run.
  * @param {any} ctx the cam context
  * @param {{ version: string, camBin?: string|null }} opts version stamp and absolute cam path
  * @returns {string} the file contents, LF only (the writer applies the EOL)
@@ -498,8 +515,11 @@ export function renderPowerShell(ctx, { version, camBin = null } = {}) {
     '# Managed file: "cam shell install" rewrites it, "cam shell uninstall" removes it.',
     '# Dot-sourced from your profile by a three-line marker block. Edits here are lost.',
     '',
-    "if ($PSVersionTable.PSVersion.Major -ge 7) { $PSNativeCommandArgumentPassing = 'Standard' }",
     'function claude {',
+    '  # Function-scoped on purpose. This file is dot-sourced, so setting it at',
+    '  # file scope would change argument passing for every native command in the',
+    "  # user's session, not just cam's own call.",
+    "  if ($PSVersionTable.PSVersion.Major -ge 7) { $PSNativeCommandArgumentPassing = 'Standard' }",
     '  $cam = $env:CAM_BIN',
     "  if (-not $cam) { $cam = (Get-Command cam -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source }",
     `  if (-not $cam) { $cam = '${abs}' }`,
@@ -510,10 +530,16 @@ export function renderPowerShell(ctx, { version, camBin = null } = {}) {
     '    & $real.Source @args; return',
     '  }',
     '  $prev = $env:CAM_TTY',
+    '  $code = 0',
     '  try {',
     "    $env:CAM_TTY = if (-not [Console]::IsInputRedirected -and -not [Console]::IsErrorRedirected) { '1' } else { '0' }",
     '    & $cam launch -- @args',
+    '    if ($null -ne $LASTEXITCODE) { $code = $LASTEXITCODE }',
     '  } finally { if ($null -eq $prev) { Remove-Item Env:CAM_TTY -ErrorAction SilentlyContinue } else { $env:CAM_TTY = $prev } }',
+    '  # $LASTEXITCODE is the failure signal to test after this function. $? is not:',
+    '  # Windows PowerShell 5.1 resets it to True at every function boundary, even',
+    "  # for a failing cmdlet, so no wrapper written as a function can carry it out.",
+    '  $global:LASTEXITCODE = $code',
     '}',
     ''
   ].join('\n');
@@ -743,16 +769,19 @@ function bodyFor(ctx, target, p) {
 /**
  * Install the `claude` hook into every given target, writing the external
  * runtime files first. With `dryRun` nothing is written and every result
- * carries the exact resulting text in `preview`.
+ * carries the exact resulting text in `preview`. A whole-file target (fish) the
+ * user wrote themselves is never overwritten unless `force` is passed: it is
+ * reported as `action:'conflict', foreign:true` and left exactly as it is.
  * @param {any} ctx the cam context
  * @param {Array<string|object>} targets ids or Target objects from detectTargets
- * @param {{ version?: string, camBin?: string|null, dryRun?: boolean }} [opts] options
+ * @param {{ version?: string, camBin?: string|null, dryRun?: boolean, force?: boolean }} [opts] options
  * @returns {Promise<Array<{id:string,shell:string,file:string,kind:string,action:string,backup?:string|null,preview?:string,dryRun:boolean,foreign?:boolean}>>} one result per runtime file and target
  */
 export async function install(ctx, targets, opts = {}) {
   const version = opts.version || ctx.version;
   const camBin = opts.camBin === undefined ? await resolveCamBin(ctx) : opts.camBin;
   const dryRun = Boolean(opts.dryRun);
+  const force = Boolean(opts.force);
   const list = await coerceTargets(ctx, targets);
   const { shellDir } = storePaths(ctx);
   const shPath = join(shellDir, 'cam.sh');
@@ -783,6 +812,19 @@ export async function install(ctx, targets, opts = {}) {
       const cur = await readTextSafe(t.file);
       const foreign = cur !== null && !cur.includes('claude-account-manager');
       const eol = cur !== null && /\r\n/.test(cur) ? '\r\n' : '\n';
+      if (foreign && !force) {
+        // The user wrote this claude.fish themselves. Overwriting it would also
+        // stamp cam's signature into it, which defeats uninstall's "never delete
+        // a file cam did not write" guard below and would delete their wrapper
+        // outright. So nothing is written, and the result says so: 'conflict'
+        // plus foreign:true. conflicts() has already reported the file as a
+        // competing `claude` definition, which is how the caller explains it.
+        results.push({
+          id: t.id, shell: t.shell, file: t.file, kind: t.kind,
+          action: 'conflict', backup: null, dryRun, foreign
+        });
+        continue;
+      }
       if (dryRun) {
         const text = body.replace(/\r?\n/g, eol);
         results.push({

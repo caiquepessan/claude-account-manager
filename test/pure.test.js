@@ -40,6 +40,7 @@ import {
   fit,
   stripAnsi,
   asciify,
+  plain,
   makeGlyphs,
   makeStyle,
   createKeyReader,
@@ -2124,6 +2125,44 @@ describe('i18n', () => {
       }
     }
     assert.deepEqual(missing, [], missing.join('\n'));
+  });
+
+  // `--ascii` promises 7-bit output. The frame builders fold their own text,
+  // but the one-line summaries of ls/which/doctor are written straight to the
+  // stream, so they fold at the point of writing — and that fold has to survive
+  // ALREADY-STYLED text, because --ascii and --no-color are separate switches.
+  // asciify alone cannot do it: it turns an escape byte into '?' by design.
+  it('plain() folds non-ASCII without destroying the ANSI around it', () => {
+    const styled = `${ESC}[38;5;245mwork · me@acme.io → ok${ESC}[0m`;
+
+    assert.equal(plain(styled, { ascii: false }), styled, 'nothing folds unless asked');
+    assert.equal(plain(styled, null), styled);
+    assert.equal(plain(styled, undefined), styled);
+
+    const folded = plain(styled, { ascii: true });
+    assert.equal(/[^\x00-\x7f]/.test(folded), false, `still not 7-bit: ${JSON.stringify(folded)}`);
+    assert.ok(folded.includes(`${ESC}[38;5;245m`), 'the opening SGR sequence was destroyed');
+    assert.ok(folded.includes(`${ESC}[0m`), 'the reset was destroyed');
+    assert.ok(folded.includes('work . me@acme.io > ok'), `unexpected fold: ${JSON.stringify(folded)}`);
+
+    assert.equal(plain('', { ascii: true }), '');
+    assert.equal(plain(null, { ascii: true }), '');
+    assert.equal(plain(undefined, { ascii: true }), '');
+  });
+
+  it('every catalogue string folds to 7-bit under --ascii', () => {
+    // pt-BR is full of accented characters and both locales use `·` and `→`.
+    // If any of them survives the fold, a terminal that asked for ASCII gets
+    // mojibake in exactly the line telling it which account is running.
+    const bad = [];
+    for (const locale of LOCALES) {
+      for (const [key, value] of Object.entries(MESSAGES[locale])) {
+        if (typeof value !== 'string') continue;
+        const folded = plain(value, { ascii: true });
+        if (/[^\x00-\x7f]/.test(folded)) bad.push(`${locale}.${key} -> ${JSON.stringify(folded)}`);
+      }
+    }
+    assert.deepEqual(bad, [], bad.join('\n'));
   });
 
   // A readline prompt legitimately ends in a space — that is where the caret

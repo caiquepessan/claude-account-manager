@@ -4,6 +4,8 @@
 
 import { WriteStream } from 'node:tty';
 
+import { envValue } from './ctx.js';
+
 /** Env values that mean "off" for a boolean-ish variable. */
 const FALSY = new Set(['', '0', 'false', 'no', 'off']);
 
@@ -43,8 +45,8 @@ function posInt(value) {
  * @param {boolean} isTTY whether the stream reported itself as a TTY
  * @returns {number} 1, 4, 8 or 24
  */
-function colorDepth(env, stream, isTTY) {
-  const force = env.FORCE_COLOR;
+function colorDepth(ctx, env, stream, isTTY) {
+  const force = envValue(ctx, 'FORCE_COLOR');
   if (force !== undefined) {
     const v = String(force).trim().toLowerCase();
     if (v === '0' || v === 'false' || v === 'no' || v === 'off') return 1;
@@ -52,9 +54,9 @@ function colorDepth(env, stream, isTTY) {
     if (v === '3') return 24;
     return 4;
   }
-  const noColor = env.NO_COLOR;
+  const noColor = envValue(ctx, 'NO_COLOR');
   if (noColor !== undefined && String(noColor) !== '') return 1;
-  if (env.TERM === 'dumb') return 1;
+  if (envValue(ctx, 'TERM') === 'dumb') return 1;
   if (!isTTY || !stream) return 1;
   if (typeof stream.getColorDepth === 'function') {
     try {
@@ -80,15 +82,15 @@ function colorDepth(env, stream, isTTY) {
  * @returns {boolean} true when unicode glyphs are safe to emit
  */
 function detectUnicode(ctx, env) {
-  if (flagOn(env.CAM_ASCII)) return false;
+  if (flagOn(envValue(ctx, 'CAM_ASCII'))) return false;
   if (ctx.ascii === true) return false;
   if (ctx.ascii === false) return true;
-  const term = env.TERM;
+  const term = envValue(ctx, 'TERM');
   if (term === 'linux' || term === 'dumb') return false;
   if (ctx.platform === 'win32') {
-    return !!(env.WT_SESSION || env.TERM_PROGRAM || env.ConEmuANSI || env.MSYSTEM);
+    return !!(envValue(ctx, 'WT_SESSION') || envValue(ctx, 'TERM_PROGRAM') || envValue(ctx, 'ConEmuANSI') || envValue(ctx, 'MSYSTEM'));
   }
-  const locale = env.LC_ALL || env.LC_CTYPE || env.LANG || '';
+  const locale = envValue(ctx, 'LC_ALL') || envValue(ctx, 'LC_CTYPE') || envValue(ctx, 'LANG') || '';
   if (/UTF-?8/i.test(locale)) return true;
   return ctx.platform === 'darwin';
 }
@@ -103,9 +105,9 @@ export function detectCaps(ctx, stream) {
   const env = ctx.env || {};
   const s = stream || (ctx.io ? ctx.io.err : null);
   const isTTY = !!(s && s.isTTY);
-  const depth = colorDepth(env, s, isTTY);
-  const cols = (isTTY ? posInt(s.columns) : 0) || posInt(env.COLUMNS) || 80;
-  const rows = (isTTY ? posInt(s.rows) : 0) || posInt(env.LINES) || 24;
+  const depth = colorDepth(ctx, env, s, isTTY);
+  const cols = (isTTY ? posInt(s.columns) : 0) || posInt(envValue(ctx, 'COLUMNS')) || 80;
+  const rows = (isTTY ? posInt(s.rows) : 0) || posInt(envValue(ctx, 'LINES')) || 24;
   const unicode = detectUnicode(ctx, env);
   return { isTTY, depth, unicode, cols, rows, ascii: !unicode };
 }
@@ -140,14 +142,35 @@ export function probeRawMode(ctx) {
 }
 
 /**
- * Is this an unattended build machine.
+ * Capabilities for a stream cam is about to WRITE a plain line to, which is a
+ * different question from what the frame builders need.
  * @param {object} ctx the cam context
- * @returns {boolean} true when any known CI variable is set to a truthy value
+ * @param {object} stream the stream being written to
+ * @returns {{isTTY: boolean, depth: number, unicode: boolean, cols: number, rows: number, ascii: boolean}} the capabilities, with `ascii` meaning "fold this line"
+ */
+export function writeCaps(ctx, stream) {
+  const caps = detectCaps(ctx, stream);
+  // A REDIRECTED stream is not a terminal that cannot draw unicode — it is a
+  // file, a pipe or a CI log, all of which carry UTF-8 perfectly well. Folding
+  // there would mangle an accented email or org name for no reason, and it
+  // would make every test that compares against a translated string fail on
+  // the fold rather than on the thing it is testing.
+  //
+  // So: fold when a real terminal says it cannot draw unicode, or when the
+  // user asked for 7-bit explicitly with --ascii / CAM_ASCII / config ascii.
+  const asked = ctx.ascii === true;
+  return { ...caps, ascii: caps.ascii === true && (caps.isTTY === true || asked) };
+}
+
+/**
+ * Is any known CI variable set to a truthy value.
+ * @param {object} ctx the cam context
+ * @returns {boolean} true when this looks like an unattended build machine
  */
 export function isCI(ctx) {
   const env = ctx.env || {};
   for (const name of CI_VARS) {
-    if (flagOn(env[name])) return true;
+    if (flagOn(envValue(ctx, name))) return true;
   }
   return false;
 }
@@ -171,21 +194,30 @@ export function interactivity(ctx, opts = {}) {
 
   // Set in EVERY process Claude Code spawns. Prompting inside its own Bash tool
   // is a hard hang on a stdin that will never deliver a byte, not a slow path.
-  if (env.CLAUDECODE === '1') return { kind: 'none', reason: ctx.t('pick.reason.claudecode') };
-  if (flagOn(env.CAM_NO_PROMPT)) return { kind: 'none', reason: ctx.t('pick.reason.noPrompt') };
+  if (envValue(ctx, 'CLAUDECODE') === '1') return { kind: 'none', reason: ctx.t('pick.reason.claudecode') };
+  if (flagOn(envValue(ctx, 'CAM_NO_PROMPT'))) return { kind: 'none', reason: ctx.t('pick.reason.noPrompt') };
   if (isCI(ctx)) return { kind: 'none', reason: ctx.t('pick.reason.ci') };
   // The shell hook says '0' when it tested `[ -t 0 ] && [ -t 2 ]` and lost.
-  if (env.CAM_TTY === '0') return { kind: 'none', reason: ctx.t('pick.reason.notATty') };
+  if (envValue(ctx, 'CAM_TTY') === '0') return { kind: 'none', reason: ctx.t('pick.reason.notATty') };
 
   const raw = probeRawMode(ctx);
   if (raw.ok) return { kind: 'raw', reason: ctx.t('doctor.terminalRaw') };
 
   // The shell knows it is a terminal even when Node does not — that is the
   // whole trick, and it is what makes the menu appear in git-bash at all.
+  // CAM_TTY=1 IS that verdict: the hook only sets it after testing `[ -t 0 ]`
+  // AND `[ -t 2 ]`, so it already vouches for stdin.
+  //
+  // Without it, stderr alone is not enough. The numbered prompt READS stdin, so
+  // granting `line` on a redirected stdin makes `echo hi | cam launch` eat the
+  // caller's piped data as menu answers, spawn nothing, and still exit 0. stdin
+  // must be a terminal of its own before cam is allowed to consume it.
   const errIsTTY = !!(ctx.io && ctx.io.err && ctx.io.err.isTTY);
-  if (env.CAM_TTY === '1' || errIsTTY) return { kind: 'line', reason: ctx.t('doctor.terminalLine') };
-
   const stdinIsTTY = !!(ctx.io && ctx.io.in && ctx.io.in.isTTY);
+  if (envValue(ctx, 'CAM_TTY') === '1' || (errIsTTY && stdinIsTTY)) {
+    return { kind: 'line', reason: ctx.t('doctor.terminalLine') };
+  }
+
   return {
     kind: 'none',
     reason: stdinIsTTY ? ctx.t('pick.reason.rawUnavailable') : ctx.t('pick.reason.notATty'),

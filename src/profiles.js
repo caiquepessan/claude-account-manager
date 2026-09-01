@@ -3,11 +3,12 @@
 // profile directories. There is no registry file that can desynchronise from disk.
 
 import { join, basename, dirname, isAbsolute } from 'node:path';
-import { readdir, readFile, stat, lstat, rm } from 'node:fs/promises';
+import { readdir, readFile, stat, lstat, mkdir, rm } from 'node:fs/promises';
 import { hostname } from 'node:os';
 
 import { fail } from './ctx.js';
 import {
+  chmodIfPosix,
   ensureDir,
   writeFileAtomic,
   writeJsonAtomic,
@@ -198,6 +199,32 @@ function str(v) {
 }
 
 /**
+ * Read an environment variable the way the OS resolves it. `ctx.env` is a plain
+ * COPY of the real environment, so on Windows it has lost the case-blind lookup
+ * the live environment provides: `$env:claude_config_dir` lands as a lower-case
+ * key that a direct property read misses. ctx.js already looks these up
+ * case-insensitively there, and this module must not disagree with it about
+ * whether an override exists — that disagreement made `cam ls` announce
+ * "respecting your CLAUDE_CONFIG_DIR" while reading the untouched ~/.claude.
+ * POSIX stays case-SENSITIVE, where a differently-cased name is a different
+ * variable that Claude Code does not honour either.
+ * @param {object} ctx the injected context
+ * @param {string} name canonical variable name
+ * @returns {string|undefined} the value, or undefined when absent
+ */
+function envGet(ctx, name) {
+  const env = (ctx && ctx.env) || {};
+  if (Object.prototype.hasOwnProperty.call(env, name)) return env[name];
+  const insensitive = ctx && (ctx.isWindows === true || ctx.platform === 'win32');
+  if (!insensitive) return undefined;
+  const upper = name.toUpperCase();
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === upper) return env[key];
+  }
+  return undefined;
+}
+
+/**
  * Case-insensitive name comparison — macOS and Windows filesystems are.
  * @param {string} a first name
  * @param {string} b second name
@@ -340,7 +367,7 @@ async function rebuildMeta(ctx, name, dir) {
  *   lastFile: string, configFile: string, isolationFile: string, defaultMetaFile: string }} the store layout
  */
 export function storePaths(ctx) {
-  const override = str(ctx.env.CAM_HOME);
+  const override = str(envGet(ctx, 'CAM_HOME'));
   const root = override || join(ctx.home, '.claude-account-manager');
   return {
     root,
@@ -380,7 +407,7 @@ export function claudePaths(ctx, dir) {
  * @returns {{ configDir: string, configFile: string, credentialsFile: string }} the default account's paths
  */
 export function defaultClaudePaths(ctx) {
-  const override = str(ctx.env.CLAUDE_CONFIG_DIR);
+  const override = str(envGet(ctx, 'CLAUDE_CONFIG_DIR'));
   const configDir = override || join(ctx.home, '.claude');
   const configFile = override ? join(override, '.claude.json') : join(ctx.home, '.claude.json');
   return {
@@ -790,6 +817,7 @@ export async function get(ctx, needle) {
  * Claim `profiles/<name>` and mark it unpublished. The directory is built IN
  * PLACE and never renamed: the macOS Keychain service name is hashed from the
  * directory path, so a rename would orphan the credential the login just wrote.
+ * The claim is EXCLUSIVE: exactly one caller can win a given name.
  * @param {object} ctx the injected context
  * @param {string} name the requested account name
  * @returns {Promise<{ dir: string }>} the profile directory, already created 0700
@@ -803,13 +831,27 @@ export async function beginCreate(ctx, name) {
   await ensureDir(ctx, profilesDir, 0o700);
 
   const dir = join(profilesDir, v.name);
-  if (await exists(dir)) {
-    fail('CONFLICT', ctx.t('err.conflict', { name: v.name }), {
-      hint: ctx.t('err.conflictHint', { name: v.name }),
-    });
-  }
 
-  await ensureDir(ctx, dir, 0o700);
+  // The claim is a single EXCLUSIVE, non-recursive mkdir, not a check followed
+  // by a create: recursive mkdir never reports EEXIST for a directory, so two
+  // `cam add work` runs started together could both pass an exists() check and
+  // both drive `claude auth login` into one directory — leaving one profile
+  // whose cached email belongs to account A and whose credentials belong to B.
+  // Here EEXIST *is* the conflict signal, whether the name was taken by another
+  // process a microsecond ago or by a profile created last week.
+  try {
+    await mkdir(dir, { mode: 0o700 });
+  } catch (cause) {
+    if (cause && (cause.code === 'EEXIST' || cause.code === 'EISDIR')) {
+      fail('CONFLICT', ctx.t('err.conflict', { name: v.name }), {
+        hint: ctx.t('err.conflictHint', { name: v.name }),
+      });
+    }
+    fail('ERROR', ctx.t('err.io', { file: dir }), { hint: ctx.t('err.ioHint'), cause });
+  }
+  // mkdir's mode is masked by the umask, so the 0700 still has to be asserted.
+  await chmodIfPosix(ctx, dir, 0o700);
+
   await writeJsonAtomic(ctx, join(dir, PENDING_FILE), {
     pid: process.pid,
     startedAt: ctx.now(),
@@ -1128,15 +1170,15 @@ export async function loadConfig(ctx) {
 
   const asks = ['auto', 'always', 'never'];
   let ask = asks.includes(String(raw.ask)) ? String(raw.ask) : 'auto';
-  const askEnv = str(ctx.env.CAM_ASK);
+  const askEnv = str(envGet(ctx, 'CAM_ASK'));
   if (askEnv && asks.includes(askEnv.toLowerCase())) ask = askEnv.toLowerCase();
 
   let claudeBin = str(raw.claudeBin);
-  const binEnv = str(ctx.env.CAM_CLAUDE_BIN);
+  const binEnv = str(envGet(ctx, 'CAM_CLAUDE_BIN'));
   if (binEnv) claudeBin = binEnv;
 
   let ascii = typeof raw.ascii === 'boolean' ? raw.ascii : null;
-  const asciiEnv = str(ctx.env.CAM_ASCII);
+  const asciiEnv = str(envGet(ctx, 'CAM_ASCII'));
   if (asciiEnv !== null) {
     const low = asciiEnv.toLowerCase();
     if (low === '1' || low === 'true' || low === 'yes') ascii = true;
@@ -1310,7 +1352,9 @@ export async function restoreProfile(ctx, name) {
 /**
  * Permanently delete one quarantined profile. This is the ONLY code path that
  * deletes: purgeTree unlinks every symlink/junction before recursing, then the
- * credential item is removed using the RECORDED ORIGINAL path (the hash input).
+ * credential item is removed using the RECORDED ORIGINAL path (the hash input) —
+ * but ONLY while that path is still vacant, because a re-created account of the
+ * same name owns both the credentials file and the Keychain item living there.
  * @param {object} ctx the injected context
  * @param {string} id the trash entry id, or an account name
  * @returns {Promise<void>} resolves when the copy is gone
@@ -1332,6 +1376,16 @@ export async function purgeTrash(ctx, id) {
 
   await purgeTree(ctx, entry.dir);
   await rmrf(ctx, entry.dir);
+
+  // A name sitting in trash is free again — beginCreate only refuses a LIVE
+  // directory — so `profiles/<name>` may now hold a different, signed-in
+  // account. Both credential backends are addressed by that path (the file
+  // backend deletes <path>/.credentials.json; the Keychain service is
+  // sha256(<path>)), so purging the quarantined copy's credential when the path
+  // is occupied would sign the user out of a working account they never named.
+  // The stale item of the purged copy is left behind instead: it is unreachable
+  // and inert, which is the strictly safer of the two mistakes.
+  if (await exists(entry.originalPath)) return;
 
   try {
     await credstore.remove(ctx, entry.originalPath);

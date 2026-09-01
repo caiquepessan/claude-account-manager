@@ -369,7 +369,12 @@ export function splitArgs(argv) {
   let own = fromHead.rest;
   let forwarded = fromTail.rest;
 
-  if (cmd === null) {
+  // `cam launch` is the same entry point spelled out, and README documents it as
+  // the hook-free one, so its leftovers must reach claude exactly as a bare
+  // `cam`'s do. Left in camArgs they reach nothing at all: run() forwards only
+  // `forwarded`, so `cam launch --cam work "fix the bug"` opened an empty session.
+  if (cmd === null || cmd === 'launch') {
+    const named = cmd === 'launch';
     // No verb up front: consume cam's own leading flags first, so `cam -v doctor`
     // still reaches doctor and only then falls back to the account shorthand.
     const consumed = [];
@@ -390,7 +395,8 @@ export function splitArgs(argv) {
     }
     const next = own[i];
     const bare = typeof next === 'string' && !next.startsWith('-');
-    const late = bare ? findCommand(next) : null;
+    // A verb the user already typed cannot be re-read out of its own arguments.
+    const late = bare && !named ? findCommand(next) : null;
     if (late) {
       cmd = late.name;
       own = consumed.concat(own.slice(i + 1));
@@ -398,8 +404,11 @@ export function splitArgs(argv) {
       cmd = 'launch';
       // A bare word here is the `cam <name>` shorthand; everything after it
       // belongs to claude, so `cam work -c` forwards -c untouched.
-      if (bare) {
-        if (camName === undefined) camName = next;
+      // It is consumed ONLY when it is actually taken as the account name:
+      // `--cam work "fix the bug"` already has its name, and swallowing the
+      // prompt there dropped it from `forwarded` and opened an empty session.
+      if (bare && camName === undefined) {
+        camName = next;
         i += 1;
       }
       forwarded = own.slice(i).concat(forwarded);

@@ -115,7 +115,9 @@ function normalizeArgs(args) {
  * @returns {void}
  */
 function out(ctx, text = '') {
-  ctx.io.out.write(`${text}\n`);
+  // `--ascii` promises 7-bit output; the table and summary lines here are
+  // written straight to the stream, so they fold at the point of writing.
+  ctx.io.out.write(`${ui.plain(text, tty.writeCaps(ctx, ctx.io.out))}\n`);
 }
 
 /**
@@ -125,7 +127,7 @@ function out(ctx, text = '') {
  * @returns {void}
  */
 function err(ctx, text = '') {
-  ctx.io.err.write(`${text}\n`);
+  ctx.io.err.write(`${ui.plain(text, tty.writeCaps(ctx, ctx.io.err))}\n`);
 }
 
 /**
@@ -516,21 +518,28 @@ async function resolveName(ctx, screen, given, taken) {
 }
 
 /**
- * Print the refusal block for a machine where account isolation cannot hold.
+ * Print the refusal block for a machine where account isolation cannot be
+ * PROVEN. The probe has three outcomes, not two — proven-isolated,
+ * proven-shared, and "no readable status" — and only the middle one may be
+ * described with add.unsafeBody, which states as observed fact that a throwaway
+ * config directory reported SIGNED IN. Anything else the probe reported becomes
+ * the body itself, so cam never claims an observation it did not make.
  * @param {any} ctx the injected context
  * @param {any} caps terminal capabilities for stderr
  * @param {string} detail what the isolation probe actually reported
  * @returns {void}
  */
 function reportUnsafe(ctx, caps, detail) {
+  const observed = typeof detail === 'string' && detail.trim() !== '' ? detail : null;
+  const provenShared = observed === null || observed === ctx.t('doctor.isolationFail');
   const lines = [
-    ctx.t('add.unsafeBody'),
+    provenShared ? ctx.t('add.unsafeBody') : observed,
     '',
     pair(ctx.t('add.unsafeCause'), ctx.t('add.unsafeCauseDetail')),
     pair(ctx.t('add.unsafeTry'), ctx.t('add.unsafeTryDetail')),
     pair('', ctx.t('app.repo')),
   ];
-  if (detail && ctx.verbose) lines.push('', String(detail));
+  if (observed && provenShared && ctx.verbose) lines.push('', observed);
   const block = ui.errorBlock({ title: ctx.t('add.unsafeTitle'), lines }, caps);
   for (const line of block) err(ctx, line);
 }
@@ -646,23 +655,36 @@ export async function cmdAdd(ctx, args) {
       say(ctx, caps, 'ok', pair(ctx.t('add.checkSeeded'), ctx.t('add.seededDetail', { n: mcp })));
     }
 
+    // What was shared is published WITH the profile: `cam doctor` reads
+    // meta.share to report it, so a record that never leaves this block makes
+    // every profile look unshared. Left null by --no-share, which finishCreate
+    // reads as "nothing shared".
+    let share = null;
     if (flags.share !== false && flags.noShare !== true) {
+      // seedShare's transcript switch is `projects`. The old `shareProjects`
+      // key matched nothing there, so --share-projects printed its warning and
+      // then shared no transcripts at all.
       const shared = await profiles.seedShare(ctx, begun.dir, {
-        shareProjects: flags.shareProjects === true,
+        projects: flags.shareProjects === true,
       });
       const linked = listOf(shared && shared.linked);
       const copied = listOf(shared && shared.copied);
       const items = [...linked, ...copied].join(', ')
         || [...(profiles.SHARE_DIRS || []), ...(profiles.SHARE_FILES || [])].join(', ');
-      let modeKey = 'share.mode.skip';
-      if (countOf(shared && shared.linked) > 0) {
-        modeKey = ctx.platform === 'win32' ? 'share.mode.junction' : 'share.mode.symlink';
-      } else if (countOf(shared && shared.copied) > 0) {
-        modeKey = 'share.mode.copy';
-      }
+      // seedShare answers the generic 'link'; the catalogue names the platform
+      // primitive, and only junction/symlink/copy/skip have a key.
+      let mode = 'skip';
+      if (linked.length > 0) mode = ctx.platform === 'win32' ? 'junction' : 'symlink';
+      else if (copied.length > 0) mode = 'copy';
+      const shareFiles = new Set(profiles.SHARE_FILES || []);
+      share = {
+        mode,
+        dirs: [...linked, ...copied].filter((n) => !shareFiles.has(n)),
+        files: copied.filter((n) => shareFiles.has(n)),
+      };
       say(ctx, caps, 'ok', pair(ctx.t('add.checkShared'), ctx.t('add.sharedDetail', {
         items,
-        mode: ctx.t(modeKey),
+        mode: ctx.t(`share.mode.${mode}`),
       })));
     }
 
@@ -786,6 +808,7 @@ export async function cmdAdd(ctx, args) {
       expiresAt: (cred && cred.expiresAt) || null,
       refreshTokenExpiresAt: (cred && cred.refreshTokenExpiresAt) || null,
       tokenFingerprint: fingerprint,
+      share,
     });
     created = null;
     await profiles.setLast(ctx, name);
@@ -907,7 +930,7 @@ export async function cmdList(ctx, args) {
       plan: planOf(p) ? ui.planLabel(planOf(p)) : ctx.t('plan.unknown'),
       org: orgOf(p) || ctx.t('plan.unknown'),
       token: p.dir === null ? ctx.t('health.unknown') : healthCell(ctx, h),
-      lastUsed: lastUsedOf(p) ? ui.relativeTime(lastUsedOf(p), now) : ctx.t('list.never'),
+      lastUsed: lastUsedOf(p) ? ui.relativeTime(lastUsedOf(p), now, ctx.t) : ctx.t('list.never'),
     });
   }
 
@@ -993,7 +1016,11 @@ export async function cmdRemove(ctx, args) {
     fail('USAGE', ctx.t('err.usage'), { hint: ctx.t('rm.usage') });
   }
   if (name === 'default') {
-    fail('USAGE', ctx.t('rm.refuseDefault'), { hint: ctx.t('shell.usage') });
+    // The same refusal in credstore.remove is UNSAFE with err.unsafeHint; a
+    // shell-install usage line was never a remedy for "you cannot remove this".
+    // Not err.unsafeHint ("run: cam doctor") — nothing about this machine is
+    // wrong. The remedy is to name one of the accounts cam actually created.
+    fail('UNSAFE', ctx.t('rm.refuseDefault'), { hint: ctx.t('rm.refuseDefaultHint') });
   }
 
   const all = await profiles.all(ctx);
@@ -1010,7 +1037,7 @@ export async function cmdRemove(ctx, args) {
     name: profile.name,
     email: emailOf(profile) || ctx.t('list.signedOut'),
     plan: ui.planLabel(planOf(profile)),
-    when: used ? ui.relativeTime(used, now) : ctx.t('time.never'),
+    when: used ? ui.relativeTime(used, now, ctx.t) : ctx.t('time.never'),
   }), caps));
   err(ctx, `  ${ctx.t('rm.explain')}`);
   err(ctx, `  ${ctx.t('rm.notRevoked')}`);
@@ -1161,8 +1188,10 @@ export async function cmdTrash(ctx, args) {
     rows: rows.map((e) => ({
       name: e.id || e.name,
       size: formatSize(e.size),
-      age: typeof e.trashedAt === 'number'
-        ? ui.relativeTime(e.trashedAt, now)
+      // listTrash names the timestamp removedAt; reading any other key made
+      // every row print "never" and left the column useless.
+      age: typeof e.removedAt === 'number'
+        ? ui.relativeTime(e.removedAt, now, ctx.t)
         : ctx.t('time.never'),
     })),
   }, capsOut);

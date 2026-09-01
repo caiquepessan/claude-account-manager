@@ -37,8 +37,8 @@ import {
   runCapture
 } from '../claude.js';
 import { detectBackend, securityAvailable } from '../credstore.js';
-import { detectCaps, probeRawMode, interactivity, isCI } from '../tty.js';
-import { statusLine, padEnd, relativeTime, planLabel } from '../ui.js';
+import { detectCaps, writeCaps, probeRawMode, interactivity, isCI } from '../tty.js';
+import { statusLine, padEnd, relativeTime, planLabel, plain } from '../ui.js';
 import {
   detectTargets,
   currentShell,
@@ -482,18 +482,26 @@ export async function checks(ctx, opts = {}) {
       if (iso && iso.ok) {
         out.push(check('isolation', t('doctor.label.isolation'), 'ok', t('doctor.isolationOk')));
       } else {
-        out.push(check('isolation', t('doctor.label.isolation'), 'fail', t('doctor.isolationFail'), {
+        // The probe fails in two different ways: it proved the config dirs are
+        // shared, or it returned nothing readable (a timeout, or output a newer
+        // Claude Code changed). Reporting both as isolationFail asserted an
+        // observation that was never made, so the probe's own verdict is the
+        // headline and only the remedy lines stay in the hint.
+        const detail = iso && iso.detail ? String(iso.detail) : t('doctor.isolationFail');
+        out.push(check('isolation', t('doctor.label.isolation'), 'fail', detail, {
           hint: [
             t('add.unsafeCause'),
             t('add.unsafeCauseDetail'),
-            t('add.unsafeTryDetail'),
-            iso && iso.detail ? String(iso.detail) : ''
+            t('add.unsafeTryDetail')
           ].filter(Boolean).join('\n')
         }));
       }
     } catch (e) {
-      out.push(check('isolation', t('doctor.label.isolation'), 'fail', t('doctor.isolationFail'), {
-        hint: t('err.unexpected', { message: String(e && e.message ? e.message : e) })
+      // A probe that threw observed nothing either: it is unreadable, not proof.
+      // The remedy differs from the proven-shared case — there is nothing to
+      // unset here, the probe simply produced no answer — so it gets its own hint.
+      out.push(check('isolation', t('doctor.label.isolation'), 'fail', t('doctor.isolationUnreadable'), {
+        hint: `${t('doctor.isolationUnreadableHint')}\n${t('err.unexpected', { message: String(e && e.message ? e.message : e) })}`
       }));
     }
   } else {
@@ -767,7 +775,7 @@ export async function checks(ctx, opts = {}) {
       hints.push(t('doctor.profileLinksBroken', { n: broken }));
     }
     if (shareMode) hints.push(shareMode);
-    if (meta && meta.checkedAt) hints.push(relativeTime(meta.checkedAt, now));
+    if (meta && meta.checkedAt) hints.push(relativeTime(meta.checkedAt, now, t));
     if (meta && meta.plan) hints.push(planLabel(meta.plan));
     if (!meta) hints.push(t('doctor.fixHint'));
 
@@ -913,7 +921,7 @@ export async function cmdDoctor(ctx, args) {
   lines.push(t('doctor.summary', { failures, warnings }));
   if (!flags.fix && list.some((c) => c.fixable)) lines.push(t('doctor.fixHint'));
   if (!flags.deep) lines.push(t('doctor.deepHint'));
-  ctx.io.out.write(`${lines.join('\n')}\n`);
+  ctx.io.out.write(`${plain(lines.join('\n'), writeCaps(ctx, ctx.io.out))}\n`);
 
   return failures > 0 ? EXIT.ERROR : EXIT.OK;
 }
@@ -923,12 +931,14 @@ export async function cmdDoctor(ctx, args) {
 /**
  * Translate a shell.js result action into its catalogue label.
  * @param {object} ctx the cam context
- * @param {string} action one of installed|updated|unchanged|removed|absent|notfound
+ * @param {string} action exactly what src/shell.js emits: created | appended |
+ *   upgraded | unchanged | removed | absent | not-installed | conflict
  * @returns {string} the translated label
  */
 function actionLabel(ctx, action) {
   // These names come from src/shell.js and are the ONLY ones it emits:
-  // created | appended | upgraded | unchanged | removed | absent | not-installed.
+  // created | appended | upgraded | unchanged | removed | absent | conflict |
+  // not-installed.
   // An earlier version of this switch invented 'installed' and 'updated', which
   // no code path produces, so every successful install fell through to the
   // default and reported "not installed" — after correctly writing the file.
@@ -941,6 +951,10 @@ function actionLabel(ctx, action) {
     case 'unchanged': return ctx.t('shell.unchanged');
     case 'removed': return ctx.t('shell.removed');
     case 'absent':
+    // 'conflict' is a whole-file target (claude.fish) that the user wrote
+    // themselves, which cam refuses to overwrite: nothing was installed, and
+    // the shell.conflict* hints in the status block explain the clash.
+    case 'conflict': return ctx.t('shell.conflictFile');
     case 'not-installed': return ctx.t('shell.absent');
     default: return ctx.t('shell.absent');
   }
@@ -1021,13 +1035,13 @@ export async function cmdShell(ctx, args) {
           caps));
       }
     }
-    ctx.io.out.write(`${lines.join('\n')}\n`);
+    ctx.io.out.write(`${plain(lines.join('\n'), writeCaps(ctx, ctx.io.out))}\n`);
     return EXIT.OK;
   }
 
   if (targets.length === 0) {
     lines.push(statusLine('warn', t('shell.noTargets'), caps));
-    ctx.io.out.write(`${lines.join('\n')}\n`);
+    ctx.io.out.write(`${plain(lines.join('\n'), writeCaps(ctx, ctx.io.out))}\n`);
     return EXIT.ERROR;
   }
 
@@ -1051,7 +1065,7 @@ export async function cmdShell(ctx, args) {
         lines.push('');
       }
       lines.push(statusLine('info', t('shell.dryRun'), caps));
-      ctx.io.out.write(`${lines.join('\n')}\n`);
+      ctx.io.out.write(`${plain(lines.join('\n'), writeCaps(ctx, ctx.io.out))}\n`);
       return EXIT.OK;
     }
 
@@ -1075,7 +1089,7 @@ export async function cmdShell(ctx, args) {
     lines.push('');
     lines.push(t('shell.reopen'));
     lines.push(t('first.askUndo'));
-    ctx.io.out.write(`${lines.join('\n')}\n`);
+    ctx.io.out.write(`${plain(lines.join('\n'), writeCaps(ctx, ctx.io.out))}\n`);
     return EXIT.OK;
   }
 
@@ -1092,6 +1106,6 @@ export async function cmdShell(ctx, args) {
   lines.push('');
   lines.push(t('shell.uninstalled', { n: removed }));
   lines.push(t('shell.reopen'));
-  ctx.io.out.write(`${lines.join('\n')}\n`);
+  ctx.io.out.write(`${plain(lines.join('\n'), writeCaps(ctx, ctx.io.out))}\n`);
   return EXIT.OK;
 }
